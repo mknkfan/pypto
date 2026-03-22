@@ -19,6 +19,8 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -35,6 +37,7 @@
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/transforms/base/visitor.h"
+#include "pypto/ir/transforms/utils/auto_name_utils.h"
 #include "pypto/ir/type.h"
 
 namespace pypto {
@@ -45,91 +48,13 @@ namespace {
 using namespace pypto::ir;  // NOLINT(build/namespaces)
 
 /**
- * @brief Extract the original base name from an SSA-renamed variable
+ * @brief Extract the semantic base name from an auto-generated IR variable
  *
- * SSA naming patterns (applied by successive passes):
- *   Regular vars: "{base}_{version}"  (e.g., "mi_update_4" -> "mi_update")
- *   Iter args:    "{base}_iter_{version}" (e.g., "mi_update_iter_2" -> "mi_update")
- *
- * Pass-pipeline suffixes (split_chunked_loops, interchange_chunk_loops):
- *   Return var:   "_rv"
- *   Loop level:   "_lN"  (interchange_chunk_loops)
- *   Chunk split:  "_outer", "_inner", "_rem"  (split_chunked_loops)
- *
- * These suffixes compose, e.g.:
- *   "output_tensor_iter_1_outer_l0_rv" -> "output_tensor"
- *
- * Stripping is applied iteratively until no more suffixes can be removed.
- * Used to match input args with output vars for inout parameter detection.
+ * New-style names use `base__qualifier_role_vN`, while legacy names continue to
+ * be accepted for compatibility. This helper normalizes both formats so codegen
+ * can match input args with output vars for inout parameter detection.
  */
-std::string GetSSABaseName(const std::string& name) {
-  // Check if `str` ends with `suffix` (length `len`) and strip it in-place.
-  // Returns false if the suffix is absent or would consume the entire string.
-  auto strip_suffix = [](std::string& str, const char* suffix, size_t len) -> bool {
-    if (str.size() > len && str.compare(str.size() - len, len, suffix) == 0) {
-      str.resize(str.size() - len);
-      return true;
-    }
-    return false;
-  };
-
-  std::string current = name;
-
-  // Iteratively strip pass-pipeline suffixes from the end
-  bool changed = true;
-  while (changed) {
-    changed = false;
-
-    // Strip "_rv" suffix (split_chunked_loops return var)
-    if (strip_suffix(current, "_rv", 3)) {
-      changed = true;
-      continue;
-    }
-
-    // Strip "_lN" suffix (interchange_chunk_loops level index)
-    {
-      size_t pos = current.rfind('_');
-      if (pos != std::string::npos && pos + 1 < current.size() && current[pos + 1] == 'l' &&
-          pos + 2 < current.size() &&
-          std::all_of(current.begin() + static_cast<ptrdiff_t>(pos + 2), current.end(), ::isdigit)) {
-        current.resize(pos);
-        changed = true;
-        continue;
-      }
-    }
-
-    // Strip "_outer", "_inner", "_rem" suffixes (split_chunked_loops)
-    if (strip_suffix(current, "_outer", 6) || strip_suffix(current, "_inner", 6) ||
-        strip_suffix(current, "_rem", 4)) {
-      changed = true;
-      continue;
-    }
-
-    // Strip "_iter_N" suffix (SSA iter_arg pattern)
-    {
-      size_t pos = current.rfind("_iter_");
-      if (pos != std::string::npos && pos > 0 &&
-          std::all_of(current.begin() + static_cast<ptrdiff_t>(pos + 6), current.end(), ::isdigit)) {
-        current.resize(pos);
-        changed = true;
-        continue;
-      }
-    }
-
-    // Strip "_N" suffix (regular SSA version)
-    {
-      size_t pos = current.rfind('_');
-      if (pos != std::string::npos && pos > 0 &&
-          std::all_of(current.begin() + static_cast<ptrdiff_t>(pos + 1), current.end(), ::isdigit)) {
-        current.resize(pos);
-        changed = true;
-        continue;
-      }
-    }
-  }
-
-  return current;
-}
+std::string GetSSABaseName(const std::string& name) { return auto_name::GetLegacyCompatibleBaseName(name); }
 
 /**
  * @brief Check if an operation is a built-in IR operation (not a user-defined function)
@@ -167,59 +92,6 @@ std::string FormatConstFloatValue(const ConstFloatPtr& c, const std::string& cpp
     return std::to_string(static_cast<float>(v));
   }
   return std::to_string(v);  // double
-}
-
-int CountReturnTensors(const FunctionPtr& func) {
-  int count = 0;
-  for (const auto& rt : func->return_types_) {
-    if (As<TensorType>(rt)) {
-      count++;
-    }
-  }
-  return count;
-}
-
-// Helper: resolve the TensorType for an intermediate tensor, handling both
-// single-return and tuple-return cases.
-TensorTypePtr GetIntermediateTensorType(
-    const ProgramPtr& program, const std::map<std::string, AssignStmtPtr>& output_tensor_assigns,
-    const std::map<std::string, std::pair<std::string, int>>& tuple_element_map,
-    const std::string& tensor_name) {
-  std::string assign_key;
-  int return_index = 0;
-
-  auto tuple_it = tuple_element_map.find(tensor_name);
-  if (tuple_it != tuple_element_map.end()) {
-    assign_key = tuple_it->second.first;
-    return_index = tuple_it->second.second;
-  } else {
-    assign_key = tensor_name;
-  }
-
-  auto assign_it = output_tensor_assigns.find(assign_key);
-  CHECK(assign_it != output_tensor_assigns.end()) << "Missing assignment info for tensor: " << assign_key;
-
-  auto call = As<Call>(assign_it->second->value_);
-  CHECK(call) << "Tensor assignment must be from a Call: " << assign_key;
-
-  std::string callee_name = call->op_->name_;
-
-  // tensor.create: type comes directly from the call's return type
-  if (callee_name == "tensor.create") {
-    auto tensor_type = As<TensorType>(call->GetType());
-    CHECK(tensor_type) << "tensor.create must return TensorType";
-    return tensor_type;
-  }
-
-  FunctionPtr callee_func = program->GetFunction(callee_name);
-  CHECK(callee_func) << "Cannot find called function: " << callee_name;
-  CHECK(return_index < static_cast<int>(callee_func->return_types_.size()))
-      << "Return index " << return_index << " out of bounds for function " << callee_name;
-
-  auto tensor_type = As<TensorType>(callee_func->return_types_[return_index]);
-  CHECK(tensor_type) << "Function " << callee_name << " return type at index " << return_index
-                     << " must be TensorType, got " << callee_func->return_types_[return_index]->TypeName();
-  return tensor_type;
 }
 
 void ValidateOrchestrationReferences(const ProgramPtr& program, const FunctionPtr& func) {
@@ -270,53 +142,30 @@ int GetOrCreateFuncId(const std::string& func_name, std::map<std::string, int>* 
   return (*func_name_to_id)[func_name];
 }
 
-// Collect metadata from IR (return_vars, output_tensors, tuple info) for memory allocation
+// Per-call tuple element: stores index, fallback name, and VarPtr for identity resolution
+struct TupleElement {
+  int index;
+  std::string fallback_name;  // GetSSABaseName result — used only if VarPtr resolution unavailable
+  const Var* var;             // VarPtr for identity-based emit name resolution
+};
+
+// Collect metadata from IR (tuple info) for orchestration codegen
 class OrchestrationInfoCollector : public IRVisitor {
  public:
-  std::vector<std::string> return_vars;
-  std::set<std::string> output_tensors;
-  std::map<const Call*, std::string> call_to_result_var;
-  std::map<std::string, AssignStmtPtr> output_tensor_assigns;            // Store AssignStmt for type info
-  std::map<std::string, std::pair<std::string, int>> tuple_element_map;  // var -> (tuple_var, index)
-  // Per-call tuple elements: key = unique call key, value = [(index, element_base_name), ...]
-  std::map<std::string, std::vector<std::pair<int, std::string>>> call_tuple_elements;
+  // Per-call tuple elements: key = unique call key, value = [TupleElement, ...]
+  std::map<std::string, std::vector<TupleElement>> call_tuple_elements;
   // Maps Call* to unique key for cross-phase coordination with StmtCodegen
   std::map<const Call*, std::string> call_to_tuple_key;
 
-  void VisitStmt_(const ReturnStmtPtr& ret) override {
-    for (const auto& val : ret->value_) {
-      if (auto var = As<Var>(val)) {
-        return_vars.push_back(GetSSABaseName(var->name_hint_));
-      } else if (auto iter_arg = As<IterArg>(val)) {
-        return_vars.push_back(GetSSABaseName(iter_arg->name_hint_));
-      }
-    }
-    IRVisitor::VisitStmt_(ret);
-  }
-
   void VisitStmt_(const AssignStmtPtr& assign) override {
     if (auto call = As<Call>(assign->value_)) {
-      if (call->op_->name_ == "tensor.create") {
-        // tensor.create produces a local tensor that needs make_tensor allocation
-        std::string var_name = GetSSABaseName(assign->var_->name_hint_);
-        output_tensors.insert(var_name);
-        output_tensor_assigns[var_name] = assign;
-      } else if (!IsBuiltinOp(call->op_->name_)) {
-        std::string var_name = GetSSABaseName(assign->var_->name_hint_);
-
+      if (!IsBuiltinOp(call->op_->name_) && call->op_->name_ != "tensor.create") {
         // Check if this call returns a TupleType
         if (As<TupleType>(call->GetType())) {
           // Generate unique key per tuple-returning call (works with/without SSA)
           std::string unique_key = "_tc_" + std::to_string(tuple_call_counter_++);
           current_tuple_key_[assign->var_->name_hint_] = unique_key;
           call_to_tuple_key[call.get()] = unique_key;
-          call_to_result_var[call.get()] = var_name;
-          output_tensor_assigns[var_name] = assign;
-        } else {
-          // Single tensor return (existing behavior)
-          output_tensors.insert(var_name);
-          call_to_result_var[call.get()] = var_name;
-          output_tensor_assigns[var_name] = assign;
         }
       }
     } else if (auto tuple_get = As<TupleGetItemExpr>(assign->value_)) {
@@ -332,12 +181,7 @@ class OrchestrationInfoCollector : public IRVisitor {
       // Find the unique key for the most recent tuple call with this var name
       auto it = current_tuple_key_.find(tuple_ref_name);
       if (it != current_tuple_key_.end()) {
-        call_tuple_elements[it->second].emplace_back(tuple_get->index_, var_name);
-        // Keep tuple_element_map for GetIntermediateTensorType compatibility
-        std::string tuple_base = GetSSABaseName(tuple_ref_name);
-        tuple_element_map[var_name] = {tuple_base, tuple_get->index_};
-        output_tensors.insert(var_name);
-        output_tensor_assigns[var_name] = assign;
+        call_tuple_elements[it->second].push_back({tuple_get->index_, var_name, assign->var_.get()});
       }
     }
     IRVisitor::VisitStmt_(assign);
@@ -347,6 +191,80 @@ class OrchestrationInfoCollector : public IRVisitor {
   int tuple_call_counter_ = 0;
   // Maps raw var name (from assign->var_->name_hint_) to the unique key of the most recent tuple call
   std::map<std::string, std::string> current_tuple_key_;
+};
+
+/**
+ * @brief Trace variable lineage from body vars back to function parameters
+ *
+ * Walks the function body and builds a mapping from every body Var* (including
+ * IterArgs, which extend Var) back to its originating function parameter Var*.
+ * This enables VarPtr-based identity checks instead of fragile string matching.
+ */
+class VarLineageCollector : public IRVisitor {
+ public:
+  std::unordered_map<const Var*, const Var*> var_to_param;
+
+  void Initialize(const std::vector<VarPtr>& params) {
+    for (const auto& param : params) {
+      var_to_param[param.get()] = param.get();
+    }
+  }
+
+ protected:
+  void VisitStmt_(const ForStmtPtr& for_stmt) override {
+    for (size_t i = 0; i < for_stmt->iter_args_.size(); ++i) {
+      const auto& iter_arg = for_stmt->iter_args_[i];
+      const Var* param = ResolveExpr(iter_arg->initValue_);
+      if (param) {
+        var_to_param[iter_arg.get()] = param;
+        if (i < for_stmt->return_vars_.size()) {
+          var_to_param[for_stmt->return_vars_[i].get()] = param;
+        }
+      }
+    }
+    IRVisitor::VisitStmt_(for_stmt);
+  }
+
+  void VisitStmt_(const WhileStmtPtr& while_stmt) override {
+    for (size_t i = 0; i < while_stmt->iter_args_.size(); ++i) {
+      const auto& iter_arg = while_stmt->iter_args_[i];
+      const Var* param = ResolveExpr(iter_arg->initValue_);
+      if (param) {
+        var_to_param[iter_arg.get()] = param;
+        if (i < while_stmt->return_vars_.size()) {
+          var_to_param[while_stmt->return_vars_[i].get()] = param;
+        }
+      }
+    }
+    IRVisitor::VisitStmt_(while_stmt);
+  }
+
+  // IfStmt lineage is not tracked: orchestration IfStmt return_vars are rare
+  // and their lineage requires analyzing yield values across branches.
+
+  void VisitStmt_(const AssignStmtPtr& assign) override {
+    if (auto src_var = AsVarLike(assign->value_)) {
+      const Var* param = ResolveVar(src_var.get());
+      if (param) {
+        var_to_param[assign->var_.get()] = param;
+      }
+    }
+    IRVisitor::VisitStmt_(assign);
+  }
+
+ private:
+  const Var* ResolveVar(const Var* var) const {
+    auto it = var_to_param.find(var);
+    return it != var_to_param.end() ? it->second : nullptr;
+  }
+
+  const Var* ResolveExpr(const ExprPtr& expr) const {
+    // Use AsVarLike to match both Var and IterArg (As<Var> won't match IterArg)
+    if (auto var = AsVarLike(expr)) {
+      return ResolveVar(var.get());
+    }
+    return nullptr;
+  }
 };
 
 }  // namespace
@@ -410,7 +328,7 @@ std::string GenerateArgDefines(const FunctionPtr& func, const std::vector<std::s
   // Pointer defines for input tensor params
   for (const auto& var : func->params_) {
     if (As<TensorType>(var->GetType())) {
-      std::string name = GetSSABaseName(var->name_hint_);
+      std::string name = auto_name::GetCompatibleBaseName(var->name_hint_);
       std::string upper_name = name;
       for (auto& ch : upper_name) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
       oss << "#define ARG_PTR_" << upper_name << " " << idx++ << "\n";
@@ -440,17 +358,6 @@ std::string GenerateHelperFunctions() {
   oss << "    return conv.u64;\n";
   oss << "}\n\n";
   return oss.str();
-}
-
-int CountExpectedArgs(const FunctionPtr& func, int return_tensor_count) {
-  int tensor_param_count = 0;
-  for (const auto& var : func->params_) {
-    if (As<TensorType>(var->GetType())) {
-      tensor_param_count++;
-    }
-  }
-  // pointers for all tensors (params + returns)
-  return tensor_param_count + return_tensor_count;
 }
 
 const char TENSOR_HELPER_FUNCTION[] = R"(
@@ -550,25 +457,23 @@ class OrchestrationStmtCodegen : public CodegenBase {
  public:
   explicit OrchestrationStmtCodegen(const ProgramPtr& prog, std::map<std::string, int>* func_ids,
                                     std::map<std::string, CoreType>* core_types, int* next_id,
-                                    const std::set<std::string>& param_names,
-                                    const std::set<std::string>& return_names)
+                                    std::unordered_map<const Var*, std::string> param_to_emit_name,
+                                    std::unordered_map<const Var*, const Var*> var_to_param,
+                                    std::set<std::string> param_name_set)
       : program_(prog),
         func_name_to_id_(func_ids),
         func_name_to_core_type_(core_types),
         next_func_id_(next_id),
-        param_names_(param_names),
-        return_names_(return_names) {}
-
-  void SetTupleElementMap(const std::map<std::string, std::pair<std::string, int>>& map) {
-    // Retained for compatibility; actual element lookup now uses SetCallTupleElements
-    (void)map;
-  }
+        param_to_emit_name_(std::move(param_to_emit_name)),
+        var_to_param_(std::move(var_to_param)),
+        param_name_set_(std::move(param_name_set)) {}
 
   // Set per-call tuple elements using unique keys (avoids cross-call collision)
-  void SetCallTupleElements(const std::map<std::string, std::vector<std::pair<int, std::string>>>& elements) {
+  void SetCallTupleElements(const std::map<std::string, std::vector<TupleElement>>& elements) {
     tuple_var_to_elements_ = elements;
     for (auto& [key, vec] : tuple_var_to_elements_) {
-      std::sort(vec.begin(), vec.end());
+      std::sort(vec.begin(), vec.end(),
+                [](const TupleElement& a, const TupleElement& b) { return a.index < b.index; });
     }
   }
 
@@ -589,21 +494,23 @@ class OrchestrationStmtCodegen : public CodegenBase {
     INTERNAL_CHECK(ci) << "Internal error: expected ConstInt expression";
     return ci->value_;
   }
-  std::string GetVarName(const VarPtr& var) override { return GetSSABaseName(var->name_hint_); }
+  std::string GetVarName(const VarPtr& var) override { return ResolveVarEmitName(var.get()); }
   [[nodiscard]] std::string TryGetVarName(const ir::ExprPtr& expr) const override {
-    // Resolve IterArg via iter_arg_to_var_ (maps to for-loop return var name)
     if (auto iter_arg = As<IterArg>(expr)) {
+      // Check iter_arg_to_var_ first (set during ForStmt processing)
       auto it = iter_arg_to_var_.find(iter_arg.get());
       if (it != iter_arg_to_var_.end()) {
         return it->second;
       }
     }
-    std::string name = CodegenBase::TryGetVarName(expr);
-    if (name.empty()) return name;
-    return GetSSABaseName(name);
+    // Match both Var and IterArg (As<Var> won't match IterArg)
+    if (auto var = AsVarLike(expr)) {
+      return ResolveVarEmitName(var.get());
+    }
+    return CodegenBase::TryGetVarName(expr);
   }
   [[nodiscard]] std::string GetTensorDataPtr(const std::string& name) const override {
-    if (param_names_.count(name) || return_names_.count(name)) {
+    if (param_name_set_.count(name)) {
       return "arg_" + name + "_ptr";
     }
     return name + ".data";
@@ -615,7 +522,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
                   "generating sequential loop as fallback";
     }
 
-    std::string loop_var = GetSSABaseName(for_stmt->loop_var_->name_hint_);
+    std::string loop_var = GetVarName(for_stmt->loop_var_);
     std::string start_expr = GenerateExprString(for_stmt->start_);
     std::string stop_expr = GenerateExprString(for_stmt->stop_);
     std::string step_expr = GenerateExprString(for_stmt->step_);
@@ -623,7 +530,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
     for (size_t i = 0; i < for_stmt->iter_args_.size(); ++i) {
       const auto& iter_arg = for_stmt->iter_args_[i];
       const auto& return_var = for_stmt->return_vars_[i];
-      std::string resolved_return = GetSSABaseName(return_var->name_hint_);
+      std::string resolved_return = GetVarName(return_var);
       std::string init_value = GenerateExprString(iter_arg->initValue_);
       // Apply ext_ prefix for tensor-type init values referencing params/returns
       if (As<TensorType>(iter_arg->GetType())) {
@@ -632,9 +539,9 @@ class OrchestrationStmtCodegen : public CodegenBase {
       // Skip iter_arg init when:
       // 1. Variable already declared (e.g., via make_tensor) — would be C++ redeclaration error
       // 2. Self-assignment after SSA name collapse (e.g., "auto oi = oi;") — C++ UB
-      // 3. Variable already exists as external tensor (param or return) — would shadow ext_ declaration
-      if (!declared_vars_.count(resolved_return) && !param_names_.count(resolved_return) &&
-          !return_names_.count(resolved_return) && resolved_return != init_value) {
+      // 3. Variable traces to a param (external tensor) — would shadow ext_ declaration
+      bool is_param_derived = ResolveToParam(return_var.get()) != nullptr;
+      if (!declared_var_names_.count(resolved_return) && !is_param_derived && resolved_return != init_value) {
         code_ << Indent() << GetCppType(iter_arg->GetType()) << " " << resolved_return << " = " << init_value
               << ";\n";
       }
@@ -650,7 +557,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
     auto saved = current_return_var_names_;
     current_return_var_names_.clear();
     for (const auto& rv : for_stmt->return_vars_) {
-      current_return_var_names_.push_back(GetSSABaseName(rv->name_hint_));
+      current_return_var_names_.push_back(GetVarName(rv));
     }
     VisitStmt(for_stmt->body_);
     current_return_var_names_ = saved;
@@ -666,7 +573,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
 
     // Declare return variables before the if block
     for (const auto& rv : if_stmt->return_vars_) {
-      code_ << Indent() << GetCppType(rv->GetType()) << " " << GetSSABaseName(rv->name_hint_) << ";\n";
+      code_ << Indent() << GetCppType(rv->GetType()) << " " << GetVarName(rv) << ";\n";
     }
 
     code_ << Indent() << "if (" << cond_expr << ") {\n";
@@ -677,7 +584,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
     auto saved = current_return_var_names_;
     current_return_var_names_.clear();
     for (const auto& rv : if_stmt->return_vars_) {
-      current_return_var_names_.push_back(GetSSABaseName(rv->name_hint_));
+      current_return_var_names_.push_back(GetVarName(rv));
     }
     VisitStmt(if_stmt->then_body_);
     current_return_var_names_ = saved;
@@ -695,7 +602,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
       auto saved2 = current_return_var_names_;
       current_return_var_names_.clear();
       for (const auto& rv : if_stmt->return_vars_) {
-        current_return_var_names_.push_back(GetSSABaseName(rv->name_hint_));
+        current_return_var_names_.push_back(GetVarName(rv));
       }
       VisitStmt(*if_stmt->else_body_);
       current_return_var_names_ = saved2;
@@ -709,12 +616,12 @@ class OrchestrationStmtCodegen : public CodegenBase {
   }
 
   void VisitStmt_(const AssignStmtPtr& assign) override {
-    std::string var_name = GetSSABaseName(assign->var_->name_hint_);
+    std::string var_name = GetVarName(assign->var_);
 
     if (auto call = As<Call>(assign->value_)) {
       const std::string& op_name = call->op_->name_;
       if (IsTensorOp(op_name)) {
-        GenerateTensorOpCode(call, var_name);
+        GenerateTensorOpCode(call, var_name, assign->var_.get());
       } else if (!IsBuiltinOp(op_name)) {
         // For tuple-returning calls, look up the unique key via Call* pointer
         std::string result_key;
@@ -726,10 +633,59 @@ class OrchestrationStmtCodegen : public CodegenBase {
         }
         GenerateFunctionCallCode(call, result_key);
 
-        // Track call result vars — task submissions don't create C++ variables,
-        // so these names are "virtual" and must be skipped in yield statements.
+        // Generate alias for InCore call return values.
+        // Return value at position i maps to the i-th Out/InOut arg (in call arg order).
+        // Emit C++ reference alias when return var name differs from the Out/InOut arg name.
         if (!As<TupleType>(call->GetType())) {
-          call_result_vars_.insert(var_name);
+          FunctionPtr callee = program_->GetFunction(call->op_->name_);
+          if (callee) {
+            for (size_t i = 0; i < callee->param_directions_.size(); ++i) {
+              if (callee->param_directions_[i] == ParamDirection::Out ||
+                  callee->param_directions_[i] == ParamDirection::InOut) {
+                std::string out_arg = TryGetVarName(call->args_[i]);
+                if (!out_arg.empty() && var_name != out_arg) {
+                  // Use VarPtr for external tensor detection
+                  const Var* arg_param = ResolveExprToParam(call->args_[i]);
+                  std::string ext_out = arg_param ? "ext_" + GetParamEmitName(arg_param) : out_arg;
+                  code_ << Indent() << "Tensor& " << var_name << " = " << ext_out << ";\n";
+                }
+                break;  // Single return → first Out/InOut
+              }
+            }
+          }
+          call_result_var_ptrs_.insert(assign->var_.get());
+        } else {
+          // For tuple returns: generate aliases for each element
+          auto tuple_key_it = call_to_tuple_key_.find(call.get());
+          if (tuple_key_it != call_to_tuple_key_.end()) {
+            auto elements_it = tuple_var_to_elements_.find(tuple_key_it->second);
+            if (elements_it != tuple_var_to_elements_.end()) {
+              FunctionPtr callee = program_->GetFunction(call->op_->name_);
+              if (callee) {
+                // Collect Out/InOut arg indices in order
+                std::vector<size_t> out_indices;
+                for (size_t i = 0; i < callee->param_directions_.size(); ++i) {
+                  if (callee->param_directions_[i] == ParamDirection::Out ||
+                      callee->param_directions_[i] == ParamDirection::InOut) {
+                    out_indices.push_back(i);
+                  }
+                }
+                // Map each tuple element to corresponding Out/InOut arg
+                for (size_t ei = 0; ei < elements_it->second.size() && ei < out_indices.size(); ++ei) {
+                  const auto& elem = elements_it->second[ei];
+                  // Resolve elem name via VarPtr identity (avoids legacy suffix collisions)
+                  std::string elem_name = ResolveVarEmitName(elem.var);
+                  std::string out_arg = TryGetVarName(call->args_[out_indices[ei]]);
+                  if (!out_arg.empty() && elem_name != out_arg) {
+                    const Var* arg_param = ResolveExprToParam(call->args_[out_indices[ei]]);
+                    std::string ext_out = arg_param ? "ext_" + GetParamEmitName(arg_param) : out_arg;
+                    code_ << Indent() << "Tensor& " << elem_name << " = " << ext_out << ";\n";
+                  }
+                  call_result_var_ptrs_.insert(elem.var);
+                }
+              }
+            }
+          }
         }
       }
     } else if (As<TupleGetItemExpr>(assign->value_)) {
@@ -758,7 +714,9 @@ class OrchestrationStmtCodegen : public CodegenBase {
         // Skip yield when:
         // 1. Self-assignment (e.g., "oi = oi;" for inplace tensor iter_args)
         // 2. Value is a task-submission result (no C++ variable exists for it)
-        if (current_return_var_names_[i] != value_expr && !call_result_vars_.count(value_expr)) {
+        auto yield_var = AsVarLike(yield_stmt->value_[i]);
+        bool is_call_result = yield_var && call_result_var_ptrs_.count(yield_var.get());
+        if (current_return_var_names_[i] != value_expr && !is_call_result) {
           code_ << Indent() << current_return_var_names_[i] << " = " << value_expr << ";\n";
         }
       }
@@ -769,7 +727,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
     if (auto call = As<Call>(eval->expr_)) {
       const std::string& op_name = call->op_->name_;
       if (IsTensorOp(op_name)) {
-        GenerateTensorOpCode(call, "");
+        GenerateTensorOpCode(call, "", nullptr);
       } else if (!IsBuiltinOp(op_name)) {
         GenerateFunctionCallCode(call, "");
       }
@@ -788,7 +746,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
 
   // Get the external tensor name (ext_ prefix for external tensors)
   [[nodiscard]] std::string GetExternalTensorName(const std::string& name) const override {
-    if (param_names_.count(name) || return_names_.count(name)) {
+    if (param_name_set_.count(name)) {
       return "ext_" + name;
     }
     return name;
@@ -818,7 +776,14 @@ class OrchestrationStmtCodegen : public CodegenBase {
           continue;
         }
 
-        std::string ext_name = GetExternalTensorName(var_name);
+        // Use VarPtr identity for external tensor detection
+        const Var* param = ResolveExprToParam(arg);
+        std::string ext_name;
+        if (param) {
+          ext_name = "ext_" + GetParamEmitName(param);
+        } else {
+          ext_name = var_name;
+        }
 
         // Classify based on callee's ParamDirection
         INTERNAL_CHECK(arg_idx < callee_func->param_directions_.size())
@@ -852,7 +817,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
     return params;
   }
 
-  void GenerateTensorOpCode(const CallPtr& call, const std::string& result_var) {
+  void GenerateTensorOpCode(const CallPtr& call, const std::string& result_var, const Var* assign_var) {
     const std::string& op_name = call->op_->name_;
 
     auto& registry = OrchestrationOpRegistry::GetInstance();
@@ -862,21 +827,30 @@ class OrchestrationStmtCodegen : public CodegenBase {
       return;
     }
 
-    // Dedup: skip if this tensor was already declared (SSA name collapse)
-    if (op_name == "tensor.create" && declared_vars_.count(result_var)) {
+    // VarPtr dedup: skip if this exact variable was already declared
+    if (op_name == "tensor.create" && assign_var && declared_var_ptrs_.count(assign_var)) {
       return;
     }
 
-    // Skip tensor.create for external tensors (params/return values) —
-    // they are already declared via make_tensor_external
-    if (op_name == "tensor.create" && (param_names_.count(result_var) || return_names_.count(result_var))) {
+    // Skip tensor.create for external tensors (params) —
+    // they are already declared via make_tensor_external.
+    // Use VarPtr identity instead of string matching.
+    if (op_name == "tensor.create" && assign_var && ResolveToParam(assign_var)) {
       return;
     }
 
-    current_result_var_ = result_var;
-    if (op_name == "tensor.create") {
-      declared_vars_.insert(result_var);
+    std::string emit_var = result_var;
+    if (op_name == "tensor.create" && assign_var) {
+      declared_var_ptrs_.insert(assign_var);
+      // Ensure unique C++ variable name: if the preferred name collides with
+      // a previously emitted declaration, fall back to the raw name_hint_
+      if (declared_var_names_.count(emit_var)) {
+        emit_var = assign_var->name_hint_;
+      }
+      declared_var_names_.insert(emit_var);
     }
+
+    current_result_var_ = emit_var;
 
     std::string gen_code = (*codegen_func)(call, *this);
 
@@ -1004,24 +978,63 @@ class OrchestrationStmtCodegen : public CodegenBase {
     task_counter_++;
   }
 
+  // --- VarPtr-based identity helpers ---
+
+  // Resolve a Var to its C++ emit name: param name for param-derived vars,
+  // GetSSABaseName for others, with collision defense against param names.
+  std::string ResolveVarEmitName(const Var* var) const {
+    const Var* param = ResolveToParam(var);
+    if (param) {
+      return GetParamEmitName(param);
+    }
+    std::string base = GetSSABaseName(var->name_hint_);
+    if (param_name_set_.count(base)) {
+      return var->name_hint_;
+    }
+    return base;
+  }
+
+  const Var* ResolveToParam(const Var* var) const {
+    auto it = var_to_param_.find(var);
+    return it != var_to_param_.end() ? it->second : nullptr;
+  }
+
+  const Var* ResolveExprToParam(const ExprPtr& expr) const {
+    // Use AsVarLike to match both Var and IterArg (As<Var> won't match IterArg)
+    if (auto var = AsVarLike(expr)) {
+      return ResolveToParam(var.get());
+    }
+    return nullptr;
+  }
+
+  const std::string& GetParamEmitName(const Var* param) const {
+    auto it = param_to_emit_name_.find(param);
+    INTERNAL_CHECK(it != param_to_emit_name_.end()) << "Internal error: param not found in emit name map";
+    return it->second;
+  }
+
   const ProgramPtr& program_;
   std::map<std::string, int>* func_name_to_id_;
   std::map<std::string, CoreType>* func_name_to_core_type_;
   int* next_func_id_;
-  const std::set<std::string>& param_names_;
-  const std::set<std::string>& return_names_;
+  // VarPtr-based identity data
+  std::unordered_map<const Var*, std::string> param_to_emit_name_;
+  std::unordered_map<const Var*, const Var*> var_to_param_;
+  std::set<std::string> param_name_set_;  // For string-only contexts (op codegen callbacks)
   std::ostringstream code_;
   int indent_ = 4;
   std::map<const IterArg*, std::string> iter_arg_to_var_;
   std::string current_result_var_;
   std::vector<std::string> current_return_var_names_;
   int task_counter_ = 0;
-  std::map<std::string, std::vector<std::pair<int, std::string>>> tuple_var_to_elements_;
+  std::map<std::string, std::vector<TupleElement>> tuple_var_to_elements_;
   std::map<const Call*, std::string> call_to_tuple_key_;  // Call* → unique key for tuple calls
-  std::set<std::string> declared_vars_;  // Track declared C++ variables for dedup after SSA name collapse
-  // Accumulates across the entire function body (not per-scope). Safe because SSA guarantees unique
-  // names — a task-submission result name from one scope cannot collide with an unrelated yield var.
-  std::set<std::string> call_result_vars_;  // Vars from task submissions (no C++ declaration, skip in yield)
+  // VarPtr-based dedup: prevents skipping tensor.create for distinct vars with same base name
+  std::unordered_set<const Var*> declared_var_ptrs_;
+  // String-based dedup: ensures unique C++ variable names in generated code
+  std::set<std::string> declared_var_names_;
+  // VarPtr-based tracking of task-submission results (no C++ declaration exists, skip in yield)
+  std::unordered_set<const Var*> call_result_var_ptrs_;
 };
 
 OrchestrationResult GenerateOrchestration(const ir::ProgramPtr& program, const ir::FunctionPtr& func) {
@@ -1040,35 +1053,36 @@ OrchestrationResult GenerateOrchestration(const ir::ProgramPtr& program, const i
   OrchestrationInfoCollector info_collector;
   info_collector.VisitStmt(func->body_);
 
-  const std::vector<std::string>& return_vars = info_collector.return_vars;
+  // Build VarPtr-based identity data
+  VarLineageCollector lineage;
+  lineage.Initialize(func->params_);
+  lineage.VisitStmt(func->body_);
 
-  // Build param and return name sets (using resolved base names)
-  std::set<std::string> param_names;
+  std::unordered_map<const Var*, std::string> param_to_emit_name;
+  std::set<std::string> param_name_set;
+  int tensor_param_count = 0;
   for (const auto& var : func->params_) {
-    param_names.insert(GetSSABaseName(var->name_hint_));
-  }
-  std::set<std::string> return_name_set(return_vars.begin(), return_vars.end());
-
-  // Deduplicate: return vars that are also params are inplace tensors,
-  // already handled via the params loop. Only return-only vars need
-  // separate ARG slots and external tensor declarations.
-  std::vector<std::string> unique_return_vars;
-  for (const auto& name : return_vars) {
-    if (!param_names.count(name)) {
-      unique_return_vars.push_back(name);
+    // Use GetCompatibleBaseName: strips auto-name suffixes (e.g., __ssa_v0)
+    // but preserves semantic name parts (e.g., _0 in out_0).
+    // Unlike GetLegacyCompatibleBaseName, does NOT strip plain numeric suffixes.
+    std::string emit_name = auto_name::GetCompatibleBaseName(var->name_hint_);
+    param_to_emit_name[var.get()] = emit_name;
+    param_name_set.insert(emit_name);
+    if (As<TensorType>(var->GetType())) {
+      tensor_param_count++;
     }
   }
 
-  int unique_return_count = static_cast<int>(unique_return_vars.size());
-  int expected_arg_count = CountExpectedArgs(func, unique_return_count);
+  // All external tensors come from params (including Out/InOut) — no return inference
+  int expected_arg_count = tensor_param_count;
 
   std::ostringstream oss;
 
   // 1. Includes
   oss << GenerateIncludes();
 
-  // 2. ARG defines
-  oss << GenerateArgDefines(func, unique_return_vars);
+  // 2. ARG defines (no separate return vars — all from params)
+  oss << GenerateArgDefines(func, {});
 
   // 3. Helper functions
   oss << GenerateHelperFunctions();
@@ -1087,66 +1101,33 @@ OrchestrationResult GenerateOrchestration(const ir::ProgramPtr& program, const i
   oss << "    (void)orch_thread_num;\n";
   oss << "    (void)orch_thread_index;\n\n";
 
-  // 7. Extract arguments
+  // 7. Extract arguments (all from params — use GetCompatibleBaseName, not legacy stripping)
   oss << "    // Extract device pointers\n";
   for (const auto& var : func->params_) {
     if (As<TensorType>(var->GetType())) {
-      std::string name = GetSSABaseName(var->name_hint_);
+      std::string name = auto_name::GetCompatibleBaseName(var->name_hint_);
       std::string upper_name = name;
       for (auto& ch : upper_name) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
       oss << "    void* arg_" << name << "_ptr = reinterpret_cast<void*>(args[ARG_PTR_" << upper_name
           << "]);\n";
     }
   }
-  for (const auto& name : unique_return_vars) {
-    std::string upper_name = name;
-    for (auto& ch : upper_name) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
-    oss << "    void* arg_" << name << "_ptr = reinterpret_cast<void*>(args[ARG_PTR_" << upper_name
-        << "]);\n";
-  }
 
   // Create statement codegen (used for both external tensor generation and task submission)
   OrchestrationStmtCodegen stmt_codegen(program, &func_name_to_id, &func_name_to_core_type, &next_func_id,
-                                        param_names, return_name_set);
-  stmt_codegen.SetTupleElementMap(info_collector.tuple_element_map);
+                                        std::move(param_to_emit_name), std::move(lineage.var_to_param),
+                                        std::move(param_name_set));
   stmt_codegen.SetCallTupleElements(info_collector.call_tuple_elements);
   stmt_codegen.SetCallToTupleKey(info_collector.call_to_tuple_key);
 
-  // 8. External tensors (make_tensor_external with shape/dtype)
+  // 8. External tensors (make_tensor_external with shape/dtype — all from params)
   oss << "\n    // External tensors\n";
   for (const auto& var : func->params_) {
     auto tensor_type = As<TensorType>(var->GetType());
     if (tensor_type) {
-      std::string name = GetSSABaseName(var->name_hint_);
+      std::string name = auto_name::GetCompatibleBaseName(var->name_hint_);
       oss << GenerateMakeTensorExternal(name, "arg_" + name + "_ptr", tensor_type, stmt_codegen);
     }
-  }
-  for (const auto& name : unique_return_vars) {
-    // Resolve TensorType for return vars.
-    // Prefer the orchestrator's declared return type: it always reflects the concrete
-    // buffer shape passed by the runtime, even when the return var was last assigned
-    // from an InCore call whose return type may contain dynamic dim variables (e.g. M).
-    //
-    // Use the var's position in return_vars (not unique_return_vars) as the index into
-    // func->return_types_, because inplace vars (params that are also returned) are
-    // excluded from unique_return_vars but still occupy slots in return_types_.
-    TensorTypePtr ret_tensor_type;
-    auto ret_pos = std::find(return_vars.begin(), return_vars.end(), name);
-    INTERNAL_CHECK(ret_pos != return_vars.end())
-        << "Internal error: return var '" << name << "' not found in return_vars";
-    {
-      size_t ret_idx = static_cast<size_t>(ret_pos - return_vars.begin());
-      if (ret_idx < func->return_types_.size()) {
-        ret_tensor_type = As<TensorType>(func->return_types_[ret_idx]);
-      }
-    }
-    // Fallback: infer from the assignment (e.g., tensor.create without a concrete return type)
-    if (!ret_tensor_type && info_collector.output_tensor_assigns.count(name)) {
-      ret_tensor_type = GetIntermediateTensorType(program, info_collector.output_tensor_assigns,
-                                                  info_collector.tuple_element_map, name);
-    }
-    CHECK(ret_tensor_type) << "Cannot resolve TensorType for return variable: " << name;
-    oss << GenerateMakeTensorExternal(name, "arg_" + name + "_ptr", ret_tensor_type, stmt_codegen);
   }
 
   // 9. Generate task submission code via statement codegen

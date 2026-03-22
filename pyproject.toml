@@ -40,6 +40,7 @@ classifiers = [
 dev = [
     "pytest>=7.0.0",
     "pytest-forked>=1.0",
+    "pytest-xdist==3.8.0",
     "pyright==1.1.407",
     "ruff==0.14.8",
     "clang-tidy==21.1.0",
@@ -68,6 +69,7 @@ ignore = [
   "ANN401",  # flake8-annotations: any-type
   "PLR2004", # pylint: magic-value-comparison
   "PLR0911", # too many return statements
+  "PLW2901", # pylint: redefined-loop-variable (DSL reassignment pattern)
 ]
 fixable = ["ALL"]
 

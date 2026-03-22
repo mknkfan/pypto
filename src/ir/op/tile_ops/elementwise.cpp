@@ -132,14 +132,12 @@ TypePtr DeduceTileOpScalarBinaryType(const std::vector<ExprPtr>& args,
   CHECK(scalar_type) << "The operator " << op_name << " requires second argument to be a ScalarType, but got "
                      << args[1]->GetType()->TypeName();
 
-  // Result has same shape as tile, with promoted dtype
-  auto result_dtype = PromoteDataTypes(tile_type->dtype_, scalar_type->dtype_);
-  CHECK(result_dtype) << "The operator " << op_name << " requires compatible data types, but got "
-                      << tile_type->dtype_.ToString() << " and " << scalar_type->dtype_.ToString();
-
+  // Result preserves the tile's element type. The hardware scalar instructions
+  // (e.g. pto.tmuls) require src and dst to share the same element type; the
+  // scalar operand is implicitly narrowed to match the tile dtype at runtime.
   TileView tile_view;
   tile_view.valid_shape = GetValidShape(tile_type);
-  return std::make_shared<TileType>(tile_type->shape_, *result_dtype, std::nullopt, tile_view);
+  return std::make_shared<TileType>(tile_type->shape_, tile_type->dtype_, std::nullopt, tile_view);
 }
 
 TypePtr DeduceTileOpIntScalarBinaryType(const std::vector<ExprPtr>& args,

@@ -18,14 +18,24 @@ from pypto.ir import MemorySpace
 
 
 def _iter_assign_stmts(func):
-    """Iterate all AssignStmt in function body (handles SeqStmts/OpStmts)."""
-    if not isinstance(func.body, ir.SeqStmts):
-        return
-    for child in func.body.stmts:
-        if isinstance(child, ir.OpStmts):
-            yield from (s for s in child.stmts if isinstance(s, ir.AssignStmt))
-        elif isinstance(child, ir.AssignStmt):
-            yield child
+    """Iterate all AssignStmt in function body."""
+
+    def _visit(stmt):
+        if isinstance(stmt, ir.AssignStmt):
+            yield stmt
+        elif isinstance(stmt, ir.SeqStmts):
+            for child in stmt.stmts:
+                yield from _visit(child)
+        elif isinstance(stmt, ir.ForStmt):
+            yield from _visit(stmt.body)
+        elif isinstance(stmt, ir.IfStmt):
+            yield from _visit(stmt.then_body)
+            if stmt.else_body is not None:
+                yield from _visit(stmt.else_body)
+        elif isinstance(stmt, ir.WhileStmt):
+            yield from _visit(stmt.body)
+
+    yield from _visit(func.body)
 
 
 def _get_tile_types(func):
@@ -46,11 +56,32 @@ def _get_param_types(func):
     return result
 
 
+def _first_function(program):
+    """Get the first function from a Program."""
+    return next(iter(program.functions.values()))
+
+
+def _is_tile_alloc_assign(stmt):
+    """Return True if stmt is an AssignStmt wrapping a tile.alloc call."""
+    return (
+        isinstance(stmt, ir.AssignStmt)
+        and isinstance(stmt.value, ir.Call)
+        and stmt.value.op.name == "tile.alloc"
+    )
+
+
+def _assert_leading_allocs(func, count):
+    """Assert that the first count statements in the body are tile.alloc assigns."""
+    assert isinstance(func.body, ir.SeqStmts)
+    assert len(func.body.stmts) >= count
+    assert all(_is_tile_alloc_assign(stmt) for stmt in func.body.stmts[:count])
+
+
 def _get_alloc_stmts(func):
     """Get tile.alloc AssignStmts from function body."""
     allocs = []
     for stmt in _iter_assign_stmts(func):
-        if isinstance(stmt.value, ir.Call) and stmt.value.op.name == "tile.alloc":
+        if _is_tile_alloc_assign(stmt):
             allocs.append(stmt)
     return allocs
 
@@ -67,7 +98,7 @@ def test_init_memref_simple():
     Also verifies:
         - addr=-1 (unallocated) for all MemRefs
         - tile.alloc statements are created for non-DDR MemRefs
-        - Body is wrapped in SeqStmts/OpStmts structure
+        - Alloc statements are prepended directly to the function body's SeqStmts
     """
 
     @pl.program
@@ -86,11 +117,10 @@ def test_init_memref_simple():
             return result
 
     After = passes.init_mem_ref()(Before)
-    func = list(After.functions.values())[0]
+    func = _first_function(After)
 
-    # Verify body is normalized (SeqStmts > OpStmts structure)
-    assert isinstance(func.body, ir.SeqStmts)
-    assert isinstance(func.body.stmts[0], ir.OpStmts)
+    # Verify body is normalized and allocs are prepended directly to the body
+    _assert_leading_allocs(func, 3)
 
     # Verify param MemRefs: all DDR, addr=-1, size=16384
     param_types = _get_param_types(func)
@@ -160,11 +190,10 @@ def test_init_memref_matmul():
             return result
 
     After = passes.init_mem_ref()(Before)
-    func = list(After.functions.values())[0]
+    func = _first_function(After)
 
     # Verify normalized structure
-    assert isinstance(func.body, ir.SeqStmts)
-    assert isinstance(func.body.stmts[0], ir.OpStmts)
+    _assert_leading_allocs(func, 5)
 
     # Verify param MemRefs: all DDR
     param_types = _get_param_types(func)
@@ -221,11 +250,7 @@ def test_init_memref_rejects_dynamic_tile_shape():
 
     tpop_call = ir.Call(ir.Op("tile.tpop_from_aic"), [], {"aiv_idx": 0}, dynamic_tile_type, span)
     body = ir.SeqStmts(
-        [
-            ir.OpStmts([ir.AssignStmt(dynamic_tile, tpop_call, span)], span),
-            ir.ReturnStmt([dynamic_tile], span),
-        ],
-        span,
+        [ir.AssignStmt(dynamic_tile, tpop_call, span), ir.ReturnStmt([dynamic_tile], span)], span
     )
     func = ir.Function("test_func", [], [dynamic_tile_type], body, span)
     program = ir.Program([func], "test_program", span)
@@ -300,7 +325,7 @@ def test_init_memref_tile_with_preset_memory_space():
     return_stmt = ir.ReturnStmt([result_var], span)
 
     body = ir.SeqStmts(
-        [ir.OpStmts([load_stmt, tpop_stmt, tpop_left_stmt, add_stmt, store_stmt], span), return_stmt],
+        [load_stmt, tpop_stmt, tpop_left_stmt, add_stmt, store_stmt, return_stmt],
         span,
     )
 
@@ -315,7 +340,7 @@ def test_init_memref_tile_with_preset_memory_space():
 
     # Run InitMemRefPass
     after = passes.init_mem_ref()(program)
-    result_func = list(after.functions.values())[0]
+    result_func = _first_function(after)
 
     # Collect TileTypes from all TileType vars (TileType exposes .memory_space)
     tile_types = _get_tile_types(result_func)
@@ -359,14 +384,9 @@ def test_init_memref_untracked_tile_defaults_to_ddr():
 
     body = ir.SeqStmts(
         [
-            ir.OpStmts(
-                [
-                    ir.AssignStmt(tile_loaded, load_call, span),
-                    ir.AssignStmt(tile_sum, add_call, span),
-                    ir.AssignStmt(result_var, store_call, span),
-                ],
-                span,
-            ),
+            ir.AssignStmt(tile_loaded, load_call, span),
+            ir.AssignStmt(tile_sum, add_call, span),
+            ir.AssignStmt(result_var, store_call, span),
             ir.ReturnStmt([result_var], span),
         ],
         span,
@@ -382,7 +402,7 @@ def test_init_memref_untracked_tile_defaults_to_ddr():
     program = ir.Program([func], "test_program", span)
 
     after = passes.init_mem_ref()(program)
-    result_func = list(after.functions.values())[0]
+    result_func = _first_function(after)
 
     add_stmt = next(
         stmt
@@ -400,8 +420,59 @@ def test_init_memref_untracked_tile_defaults_to_ddr():
     assert cast(ir.ConstInt, external_tile_type.memref.addr_).value == -1
 
 
-def test_init_memref_for_return_var_inherits_iter_arg_memory_space():
-    """Regression: ForStmt return vars must override stale DDR with iter_arg memory space."""
+def test_init_memref_single_stmt_body_prepends_alloc():
+    """InitMemRef prepends allocs even when the function body is a single statement."""
+    span = ir.Span.unknown()
+
+    input_tensor = ir.Var("input_tensor", ir.TensorType([64, 64], ir.DataType.FP32), span)
+    tile_loaded = ir.Var(
+        "tile_loaded", ir.TileType([64, 64], ir.DataType.FP32, memory_space=MemorySpace.Vec), span
+    )
+
+    load_call = ir.Call(ir.Op("tile.load"), [input_tensor, _ci(0), _ci(0), _ci(64), _ci(64)], span)
+    body = ir.AssignStmt(tile_loaded, load_call, span)
+
+    func = ir.Function("test_func", [(input_tensor, ir.ParamDirection.In)], [], body, span)
+    program = ir.Program([func], "test_program", span)
+
+    after = passes.init_mem_ref()(program)
+    result_func = _first_function(after)
+
+    assert isinstance(result_func.body, ir.SeqStmts)
+    assert len(result_func.body.stmts) == 2
+    assert isinstance(result_func.body.stmts[0], ir.AssignStmt)
+    assert isinstance(result_func.body.stmts[0].value, ir.Call)
+    assert result_func.body.stmts[0].value.op.name == "tile.alloc"
+    assert isinstance(result_func.body.stmts[1], ir.AssignStmt)
+    assert result_func.body.stmts[1].var.name_hint == "tile_loaded"
+
+    allocs = _get_alloc_stmts(result_func)
+    assert len(allocs) == 1
+    assert allocs[0].value.op.name == "tile.alloc"
+    assert allocs[0].var.name_hint.startswith("mem_vec_")
+
+
+def _find_yield_stmt(stmt):
+    """Recursively find YieldStmt in a statement tree."""
+    if isinstance(stmt, ir.YieldStmt):
+        return stmt
+    if isinstance(stmt, ir.SeqStmts):
+        for child in stmt.stmts:
+            result = _find_yield_stmt(child)
+            if result:
+                return result
+    return None
+
+
+def test_init_memref_for_stmt_loop_carry_memref_relationships():
+    """ForStmt loop-carry variables have two MemRef sharing groups after InitMemRef.
+
+    Group A: initValue + iter_arg (iter_arg inherits from initValue)
+    Group B: yield value + return_var (return_var inherits from yield value)
+
+    Group A and B may have different MemRefs — the yield-to-iter_arg mismatch
+    is resolved later by MemoryReuse (which inserts tile.move if needed).
+    """
     span = ir.Span.unknown()
 
     input_tensor = ir.Var("input_tensor", ir.TensorType([64, 64], ir.DataType.FP32), span)
@@ -412,14 +483,21 @@ def test_init_memref_for_return_var_inherits_iter_arg_memory_space():
         init_tile, ir.Call(ir.Op("tile.load"), [input_tensor, _ci(0), _ci(0), _ci(64), _ci(64)], span), span
     )
 
+    other_tile = ir.Var(
+        "other_tile", ir.TileType([64, 64], ir.DataType.FP32, memory_space=MemorySpace.Vec), span
+    )
+    other_stmt = ir.AssignStmt(
+        other_tile, ir.Call(ir.Op("tile.load"), [input_tensor, _ci(0), _ci(0), _ci(64), _ci(64)], span), span
+    )
+
     iter_arg = ir.IterArg("acc_iter", ir.TileType([64, 64], ir.DataType.FP32), init_tile, span)
     next_tile = ir.Var(
         "acc_next", ir.TileType([64, 64], ir.DataType.FP32, memory_space=MemorySpace.Vec), span
     )
-    next_stmt = ir.AssignStmt(next_tile, ir.Call(ir.Op("tile.add"), [iter_arg, init_tile], span), span)
+    next_stmt = ir.AssignStmt(next_tile, ir.Call(ir.Op("tile.add"), [iter_arg, other_tile], span), span)
     return_var = ir.Var("acc_out", ir.TileType([64, 64], ir.DataType.FP32), span)
 
-    loop_body = ir.SeqStmts([ir.OpStmts([next_stmt], span), ir.YieldStmt([next_tile], span)], span)
+    loop_body = ir.SeqStmts([next_stmt, ir.YieldStmt([next_tile], span)], span)
     loop_stmt = ir.ForStmt(
         ir.Var("i", ir.ScalarType(ir.DataType.INDEX), span),
         _ci(0),
@@ -430,7 +508,7 @@ def test_init_memref_for_return_var_inherits_iter_arg_memory_space():
         [return_var],
         span,
     )
-    body = ir.SeqStmts([ir.OpStmts([init_stmt], span), loop_stmt, ir.ReturnStmt([return_var], span)], span)
+    body = ir.SeqStmts([init_stmt, other_stmt, loop_stmt, ir.ReturnStmt([return_var], span)], span)
     func = ir.Function(
         "test_func",
         [(input_tensor, ir.ParamDirection.In)],
@@ -441,20 +519,48 @@ def test_init_memref_for_return_var_inherits_iter_arg_memory_space():
     program = ir.Program([func], "test_program", span)
 
     after = passes.init_mem_ref()(program)
-    result_func = list(after.functions.values())[0]
+    result_func = _first_function(after)
 
-    assert isinstance(result_func.body, ir.SeqStmts)
     loop_after = cast(
-        ir.ForStmt, next(stmt for stmt in result_func.body.stmts if isinstance(stmt, ir.ForStmt))
+        ir.ForStmt,
+        next(stmt for stmt in cast(ir.SeqStmts, result_func.body).stmts if isinstance(stmt, ir.ForStmt)),
     )
     loop_iter_arg = loop_after.iter_args[0]
     loop_return_var = loop_after.return_vars[0]
+    yield_stmt = _find_yield_stmt(loop_after.body)
+    assert yield_stmt is not None
+    yield_var = yield_stmt.value[0]
 
-    assert isinstance(loop_iter_arg.type, ir.TileType)
-    assert isinstance(loop_return_var.type, ir.TileType)
-    assert loop_iter_arg.type.memory_space == MemorySpace.Vec
-    assert loop_return_var.type.memory_space == MemorySpace.Vec
-    assert loop_iter_arg.type.shares_memref_with(loop_return_var.type)
+    # Find initValue after transformation (iter_arg.init_value)
+    init_value = loop_iter_arg.initValue
+    assert isinstance(init_value, ir.Var)
+
+    # All 4 variables must have TileType with MemRef in Vec space
+    for name, var_type in [
+        ("initValue", init_value.type),
+        ("iter_arg", loop_iter_arg.type),
+        ("yield_value", yield_var.type),
+        ("return_var", loop_return_var.type),
+    ]:
+        assert isinstance(var_type, ir.TileType), f"{name} should be TileType"
+        assert var_type.memref is not None, f"{name} should have MemRef"
+        assert var_type.memory_space == MemorySpace.Vec, f"{name} should be Vec"
+
+    # Group A: initValue and iter_arg share the same MemRef
+    init_tile = cast(ir.TileType, init_value.type)
+    iter_arg_tile = cast(ir.TileType, loop_iter_arg.type)
+    yield_tile = cast(ir.TileType, yield_var.type)
+    return_var_tile = cast(ir.TileType, loop_return_var.type)
+
+    assert init_tile.shares_memref_with(iter_arg_tile), "initValue and iter_arg must share MemRef"
+
+    # Group B: yield value and return_var share the same MemRef
+    assert yield_tile.shares_memref_with(return_var_tile), "yield value and return_var must share MemRef"
+
+    # Group A and B have different MemRefs (yield gets independent MemRef from tile.add)
+    assert not yield_tile.shares_memref_with(iter_arg_tile), (
+        "yield value should get its own MemRef from tile.add, not share with iter_arg"
+    )
 
 
 if __name__ == "__main__":

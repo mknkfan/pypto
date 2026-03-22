@@ -82,6 +82,7 @@ class ASTParser:
         strict_ssa: bool = False,
         closure_vars: dict[str, Any] | None = None,
         buffer_name_meta: dict[tuple[str, str], dict[str, Any]] | None = None,
+        dyn_var_cache: dict[str, ir.Var] | None = None,
     ):
         """Initialize AST parser.
 
@@ -97,6 +98,9 @@ class ASTParser:
             buffer_name_meta: Optional shared (func_name, buffer_name) → metadata registry for cross-function
                 import_peer_buffer resolution. When multiple functions in a @pl.program share this
                 dict, import_peer_buffer can resolve .base from a peer function's reserve_buffer.
+            dyn_var_cache: Optional shared cache mapping dynamic var names to ir.Var objects.
+                When multiple functions in a @pl.program share this dict, the same DynVar
+                produces the same ir.Var across functions.
         """
         self.span_tracker = SpanTracker(source_file, source_lines, line_offset, col_offset)
         self.scope_manager = ScopeManager(strict_ssa=strict_ssa)
@@ -108,6 +112,7 @@ class ASTParser:
             expr_evaluator=self.expr_evaluator,
             scope_lookup=self.scope_manager.lookup_var,
             span_tracker=self.span_tracker,
+            dyn_var_cache=dyn_var_cache,
         )
         self.builder = IRBuilder()
         self.global_vars = global_vars or {}  # Track GlobalVars for cross-function calls
@@ -394,7 +399,10 @@ class ASTParser:
                     and value_expr.type.dtype == DataType.INDEX
                 ):
                     override_type = resolved
-        var = self.builder.let(var_name, value_expr, type=override_type, span=span)
+        # Reuse existing Var on reassignment (override_type is intentionally
+        # discarded — the Var's type was fixed at first definition; the SSA
+        # pass will create properly typed versioned copies later).
+        var = self._assign_or_let(var_name, value_expr, span, override_type)
 
         # Register in scope
         self.scope_manager.define_var(var_name, var, span=span)
@@ -402,6 +410,35 @@ class ASTParser:
         # Track buffer metadata for attribute access (e.g., pipe_buf.base)
         if isinstance(stmt.value, ast.Call):
             self._track_buffer_meta(var_name, stmt.value)
+
+    def _assign_or_let(
+        self,
+        var_name: str,
+        value_expr: ir.Expr,
+        span: ir.Span,
+        override_type: ir.Type | None = None,
+    ) -> ir.Var:
+        """Assign to existing Var if possible, otherwise create a new let binding."""
+        existing_var = self.scope_manager.lookup_var(var_name)
+        if existing_var is not None and type(existing_var) is ir.Var and not self.scope_manager.strict_ssa:
+            # Reject reassignment with a different type (#642).  Same Python
+            # variable maps to the same Var node, so the type must match.
+            value_type = override_type or value_expr.type
+            if (
+                not isinstance(value_type, ir.UnknownType)
+                and not isinstance(existing_var.type, ir.UnknownType)
+                and existing_var.type != value_type
+            ):
+                raise ParserTypeError(
+                    f"Cannot reassign '{var_name}' with a different type: "
+                    f"was {ir.python_print_type(existing_var.type)}, "
+                    f"got {ir.python_print_type(value_type)}",
+                    span=span,
+                    hint="Use a different variable name for tensors with different shapes or dtypes",
+                )
+            self.builder.assign(existing_var, value_expr, span=span)
+            return existing_var
+        return self.builder.let(var_name, value_expr, type=override_type, span=span)
 
     def parse_assignment(self, stmt: ast.Assign) -> None:
         """Parse regular assignment: var = value or tuple unpacking.
@@ -439,7 +476,7 @@ class ASTParser:
                             hint="Use simple variable names in tuple unpacking: a, b, c = func()",
                         )
                     item_expr = ir.TupleGetItemExpr(tuple_var, i, span)
-                    var = self.builder.let(elt.id, item_expr, span=span)
+                    var = self._assign_or_let(elt.id, item_expr, span)
                     self.scope_manager.define_var(elt.id, var, span=span)
                 return
 
@@ -473,7 +510,7 @@ class ASTParser:
                         return
 
                 value_expr = self.parse_expression(stmt.value)
-                var = self.builder.let(var_name, value_expr, span=span)
+                var = self._assign_or_let(var_name, value_expr, span)
                 self.scope_manager.define_var(var_name, var, span=span)
 
                 # Track buffer metadata for attribute access (e.g., pipe_buf.base)
@@ -868,17 +905,19 @@ class ASTParser:
         if not self._is_cond_call(stmt):
             return None
 
-        call = stmt.value  # type: ignore[union-attr]
+        assert isinstance(stmt, ast.Expr)
+        call = stmt.value
+        assert isinstance(call, ast.Call)
 
         # Parse the condition argument
-        if len(call.args) != 1:  # type: ignore[attr-defined]
+        if len(call.args) != 1:
             raise ParserSyntaxError(
                 "pl.cond() requires exactly 1 argument",
                 span=self.span_tracker.get_span(call),
                 hint="Use: pl.cond(condition)",
             )
 
-        return self.parse_expression(call.args[0])  # type: ignore[attr-defined]
+        return self.parse_expression(call.args[0])
 
     @staticmethod
     def _is_dsl_call(stmt: ast.Expr, func_name: str) -> bool:
@@ -936,10 +975,11 @@ class ASTParser:
 
     def _handle_static_print(self, stmt: ast.Expr) -> None:
         """Handle pl.static_print() — print IR info to stdout at parse time."""
-        call = stmt.value  # type: ignore[union-attr]
+        call = stmt.value
+        assert isinstance(call, ast.Call)
         span = self.span_tracker.get_span(stmt)
 
-        if not call.args:  # type: ignore[union-attr]
+        if not call.args:
             raise ParserSyntaxError(
                 "static_print() requires at least 1 argument",
                 span=span,
@@ -947,7 +987,7 @@ class ASTParser:
             )
 
         parts: list[str] = []
-        for arg in call.args:  # type: ignore[union-attr]
+        for arg in call.args:
             # String literals are printed as-is (labels)
             if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
                 parts.append(arg.value)
@@ -962,10 +1002,11 @@ class ASTParser:
 
     def _handle_static_assert(self, stmt: ast.Expr) -> None:
         """Handle pl.static_assert() — assert condition at parse time."""
-        call = stmt.value  # type: ignore[union-attr]
+        call = stmt.value
+        assert isinstance(call, ast.Call)
         span = self.span_tracker.get_span(stmt)
 
-        args = call.args  # type: ignore[union-attr]
+        args = call.args
         if len(args) < 1 or len(args) > 2:
             raise ParserSyntaxError(
                 "static_assert() requires 1 or 2 arguments",
@@ -1215,28 +1256,6 @@ class ASTParser:
             self._loop_kind_stack.pop()
             self.current_loop_builder = None
 
-    def _parse_if_else_branch(
-        self,
-        stmt: ast.If,
-        if_builder: Any,
-        should_leak: bool,
-        pre_if_parent_scope: dict | None,
-        post_then_parent_scope: dict | None,
-    ) -> None:
-        """Parse the else branch of an if statement and restore then-branch leaks."""
-        if should_leak and pre_if_parent_scope is not None:
-            self.scope_manager.scopes[-1] = dict(pre_if_parent_scope)
-        if_builder.else_()
-        self.scope_manager.enter_scope("else")
-        for else_stmt in stmt.orelse:
-            self.parse_statement(else_stmt)
-        self.scope_manager.exit_scope(leak_vars=should_leak)
-        # Re-apply then-branch leaks so they are visible after the if.
-        if should_leak and post_then_parent_scope is not None:
-            for name, val in post_then_parent_scope.items():
-                if name not in (pre_if_parent_scope or {}):
-                    self.scope_manager.scopes[-1][name] = val
-
     def parse_if_statement(self, stmt: ast.If) -> None:
         """Parse if statement with phi nodes.
 
@@ -1275,24 +1294,19 @@ class ASTParser:
                 # Determine if we should leak variables (no explicit yields)
                 should_leak = not bool(then_yield_vars)
 
-                # Snapshot parent scope before then branch so else branch
-                # does not see variables leaked from then branch.
-                pre_if_parent_scope = dict(self.scope_manager.scopes[-1]) if should_leak else None
-
                 # Parse then branch (yield types captured via _current_yield_types)
                 self.scope_manager.enter_scope("if")
                 for then_stmt in stmt.body:
                     self.parse_statement(then_stmt)
                 self.scope_manager.exit_scope(leak_vars=should_leak)
 
-                # Capture what then branch leaked into parent scope before restoring.
-                post_then_parent_scope = dict(self.scope_manager.scopes[-1]) if should_leak else None
-
                 # Parse else branch if present
                 if stmt.orelse:
-                    self._parse_if_else_branch(
-                        stmt, if_builder, should_leak, pre_if_parent_scope, post_then_parent_scope
-                    )
+                    if_builder.else_()
+                    self.scope_manager.enter_scope("else")
+                    for else_stmt in stmt.orelse:
+                        self.parse_statement(else_stmt)
+                    self.scope_manager.exit_scope(leak_vars=should_leak)
 
                 # Declare return vars AFTER parsing branches so captured yield types
                 # are available for unannotated yields (fixes issue #233 / #234)
@@ -1611,6 +1625,8 @@ class ASTParser:
             return self.parse_tuple_literal(expr)
         elif isinstance(expr, ast.Subscript):
             return self.parse_subscript(expr)
+        elif isinstance(expr, ast.BoolOp):
+            return self.parse_boolop(expr)
         else:
             raise UnsupportedFeatureError(
                 f"Unsupported expression type: {type(expr).__name__}",
@@ -1823,6 +1839,37 @@ class ASTParser:
                 return ir.ConstFloat(-operand.value, operand.dtype, span)
 
         return op_map[op_type](operand, span)
+
+    def parse_boolop(self, boolop: ast.BoolOp) -> ir.Expr:
+        """Parse boolean operation (and/or).
+
+        Chains multiple values with left-to-right associativity:
+        ``a and b and c`` becomes ``And(And(a, b), c)``.
+
+        Args:
+            boolop: BoolOp AST node
+
+        Returns:
+            IR boolean expression
+        """
+        span = self.span_tracker.get_span(boolop)
+        op_map: dict[type, Any] = {
+            ast.And: ir.and_,
+            ast.Or: ir.or_,
+        }
+        op_type = type(boolop.op)
+        if op_type not in op_map:
+            raise UnsupportedFeatureError(
+                f"Unsupported boolean operator: {op_type.__name__}",
+                span=span,
+                hint="Use 'and' or 'or'",
+            )
+        ir_op = op_map[op_type]
+        values = [self.parse_expression(v) for v in boolop.values]
+        result = values[0]
+        for val in values[1:]:
+            result = ir_op(result, val, span)
+        return result
 
     def parse_call(self, call: ast.Call) -> ir.Expr:
         """Parse function call.
@@ -2975,13 +3022,12 @@ class ASTParser:
                                 if isinstance(elt, ast.Name):
                                     yield_vars.append((elt.id, None))
 
-            # Recursively scan nested if statements
+            # Skip nested if statements — each nested if's yields are
+            # its own return_vars, handled by parse_if_statement when
+            # it processes that specific if node. Recursing would
+            # incorrectly count inner yields as outer return_vars.
             elif isinstance(stmt, ast.If):
-                yield_vars.extend(self._scan_for_yields(stmt.body))
-                if stmt.orelse:
-                    # Only take yields from else if they match then branch
-                    # For simplicity, just take from then branch
-                    pass
+                pass
 
         return yield_vars
 

@@ -47,12 +47,12 @@ from pypto.runtime import RunConfig, TensorSpec, run
 @pl.function(type=pl.FunctionType.InCore)
 def kernel_init_inplace(
     oi: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
-    li: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
-    mi: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
+    li: pl.Out[pl.Tensor[[16, 1], pl.FP32, pl.DN]],
+    mi: pl.Out[pl.Tensor[[16, 1], pl.FP32, pl.DN]],
 ) -> tuple[
     pl.Tensor[[16, 128], pl.FP32],
-    pl.Tensor[[16, 1], pl.FP32],
-    pl.Tensor[[16, 1], pl.FP32],
+    pl.Tensor[[16, 1], pl.FP32, pl.DN],
+    pl.Tensor[[16, 1], pl.FP32, pl.DN],
 ]:
     """Initialize inplace accumulators to zero (VECTOR)."""
     return oi, li, mi
@@ -236,8 +236,7 @@ def build_paged_attention_program(
 
         # ── Orchestration function ──────────────────────────────────────────
         # Parameters: query, key_cache, value_cache, block_table, context_lens,
-        #             out, config (7 tensors) + size_query, size_key_cache,
-        #             size_value_cache (3 byte-size scalars)
+        #             out, config (7 tensors)
         @pl.function(type=pl.FunctionType.Orchestration)
         def paged_attention(
             self,
@@ -246,11 +245,8 @@ def build_paged_attention_program(
             value_cache: pl.Tensor[[key_cache_rows, head_dim], pl.BF16],
             block_table: pl.Tensor[[block_table_flat_size], pl.INT32],
             context_lens: pl.Tensor[[batch], pl.INT32],
-            out: pl.Tensor[[out_rows, head_dim], pl.FP32],
+            out: pl.Out[pl.Tensor[[out_rows, head_dim], pl.FP32]],
             config: pl.Tensor[[7], pl.INT64],
-            size_query: pl.Tensor[[1], pl.INT64],
-            size_key_cache: pl.Tensor[[1], pl.INT64],
-            size_value_cache: pl.Tensor[[1], pl.INT64],
         ) -> pl.Tensor[[out_rows, head_dim], pl.FP32]:
             """Paged attention orchestration.
 
@@ -276,21 +272,29 @@ def build_paged_attention_program(
                     cur_offset = b_idx * q_head_num + q_idx * q_tile
 
                     # Create inplace accumulators for this q_tile group
-                    oi: pl.Tensor[[q_tile, head_dim_cfg], pl.FP32] = pl.create_tensor(
-                        [q_tile, head_dim_cfg],  # type: ignore[reportArgumentType]
+                    oi_buf: pl.Tensor[[q_tile, head_dim_cfg], pl.FP32] = pl.create_tensor(
+                        [q_tile, head_dim_cfg],
                         dtype=pl.FP32,
                     )
-                    li_update: pl.Tensor[[q_tile, 1], pl.FP32] = pl.create_tensor([q_tile, 1], dtype=pl.FP32)  # type: ignore[reportArgumentType]
-                    mi_update: pl.Tensor[[q_tile, 1], pl.FP32] = pl.create_tensor([q_tile, 1], dtype=pl.FP32)  # type: ignore[reportArgumentType]
+                    li_buf: pl.Tensor[[q_tile, 1], pl.FP32, pl.DN] = pl.create_tensor(
+                        [q_tile, 1],
+                        dtype=pl.FP32,
+                        layout=pl.DN,
+                    )
+                    mi_buf: pl.Tensor[[q_tile, 1], pl.FP32, pl.DN] = pl.create_tensor(
+                        [q_tile, 1],
+                        dtype=pl.FP32,
+                        layout=pl.DN,
+                    )
 
                     # Initialize accumulators via shared module-level InCore kernel
-                    oi, li_update, mi_update = kernel_init_inplace(oi, li_update, mi_update)
+                    oi, li_update, mi_update = kernel_init_inplace(oi_buf, li_buf, mi_buf)
 
                     for bn in pl.range(bn_this_batch):
                         # Query view: row offset = b_idx * num_heads + q_idx * q_tile
                         qi: pl.Tensor[[q_tile, head_dim_cfg], pl.BF16] = pl.slice(
                             query,
-                            [q_tile, head_dim_cfg],  # type: ignore[reportArgumentType]
+                            [q_tile, head_dim_cfg],
                             [cur_offset, 0],
                         )
 
@@ -302,64 +306,74 @@ def build_paged_attention_program(
                         kv_block_row = cur_block_idx * block_size_cfg
                         kj: pl.Tensor[[head_dim_cfg, block_size_cfg], pl.BF16, pl.DN] = pl.slice(
                             key_cache,
-                            [head_dim_cfg, block_size_cfg],  # type: ignore[reportArgumentType]
+                            [head_dim_cfg, block_size_cfg],
                             [kv_block_row, 0],
                         )
                         vj: pl.Tensor[[block_size_cfg, head_dim_cfg], pl.BF16] = pl.slice(
                             value_cache,
-                            [block_size_cfg, head_dim_cfg],  # type: ignore[reportArgumentType]
+                            [block_size_cfg, head_dim_cfg],
                             [kv_block_row, 0],
                         )
 
-                        sij: pl.Tensor[[q_tile, block_size_cfg], pl.FP32] = pl.create_tensor(
-                            [q_tile, block_size_cfg],  # type: ignore[reportArgumentType]
+                        sij_buf: pl.Tensor[[q_tile, block_size_cfg], pl.FP32] = pl.create_tensor(
+                            [q_tile, block_size_cfg],
                             dtype=pl.FP32,
                         )
 
                         # QK matmul (CUBE) via shared module-level InCore kernel
-                        sij = kernel_qk_matmul(qi, kj, sij)
+                        sij = kernel_qk_matmul(qi, kj, sij_buf)
                         sij_valid: pl.Tensor[[q_tile, valid_len], pl.FP32] = pl.slice(
                             sij,
-                            [q_tile, valid_len],  # type: ignore[reportArgumentType]
+                            [q_tile, valid_len],
                             [0, 0],
                         )
 
-                        pij_f16: pl.Tensor[[q_tile, block_size_cfg], pl.BF16] = pl.create_tensor(
-                            [q_tile, block_size_cfg],  # type: ignore[reportArgumentType]
+                        pij_f16_buf: pl.Tensor[[q_tile, block_size_cfg], pl.BF16] = pl.create_tensor(
+                            [q_tile, block_size_cfg],
                             dtype=pl.BF16,
                         )
-                        mi: pl.Tensor[[q_tile, 1], pl.FP32] = pl.create_tensor([q_tile, 1], dtype=pl.FP32)  # type: ignore[reportArgumentType]
-                        li: pl.Tensor[[q_tile, 1], pl.FP32] = pl.create_tensor([q_tile, 1], dtype=pl.FP32)  # type: ignore[reportArgumentType]
+                        mi_sm_buf: pl.Tensor[[q_tile, 1], pl.FP32] = pl.create_tensor(
+                            [q_tile, 1], dtype=pl.FP32
+                        )
+                        li_sm_buf: pl.Tensor[[q_tile, 1], pl.FP32] = pl.create_tensor(
+                            [q_tile, 1], dtype=pl.FP32
+                        )
 
                         # Softmax prepare (VECTOR) via shared module-level InCore kernel
-                        pij_f16, mi, li = kernel_softmax_prepare(sij_valid, 1.0, pij_f16, mi, li)  # type: ignore[reportArgumentType]
+                        pij_f16, mi, li = kernel_softmax_prepare(
+                            sij_valid,
+                            1.0,  # type: ignore[reportArgumentType]
+                            pij_f16_buf,
+                            mi_sm_buf,
+                            li_sm_buf,
+                        )
 
-                        oi_tmp: pl.Tensor[[q_tile, head_dim_cfg], pl.FP32] = pl.create_tensor(
-                            [q_tile, head_dim_cfg],  # type: ignore[reportArgumentType]
+                        oi_tmp_buf: pl.Tensor[[q_tile, head_dim_cfg], pl.FP32] = pl.create_tensor(
+                            [q_tile, head_dim_cfg],
                             dtype=pl.FP32,
                         )
                         # PV matmul (CUBE) via shared module-level InCore kernel
-                        oi_tmp = kernel_pv_matmul(pij_f16, vj, oi_tmp)
+                        oi_tmp = kernel_pv_matmul(pij_f16, vj, oi_tmp_buf)
 
                         # Conditional flags
                         if bn == 0:
-                            is_first: pl.Scalar[pl.INT64] = pl.yield_(1)  # type: ignore[reportArgumentType]
+                            is_first: pl.Scalar[pl.INT64] = pl.yield_(1)
                         else:
-                            is_first: pl.Scalar[pl.INT64] = pl.yield_(0)  # type: ignore[reportArgumentType]
+                            is_first: pl.Scalar[pl.INT64] = pl.yield_(0)
                         if bn == bn_this_batch - 1:
-                            is_last: pl.Scalar[pl.INT64] = pl.yield_(1)  # type: ignore[reportArgumentType]
+                            is_last: pl.Scalar[pl.INT64] = pl.yield_(1)
                         else:
-                            is_last: pl.Scalar[pl.INT64] = pl.yield_(0)  # type: ignore[reportArgumentType]
+                            is_last: pl.Scalar[pl.INT64] = pl.yield_(0)
 
                         # Output view: same row offset as query view
-                        out_view: pl.Tensor[[q_tile, head_dim_cfg], pl.FP32] = pl.slice(
+                        out_view_buf: pl.Tensor[[q_tile, head_dim_cfg], pl.FP32] = pl.slice(
                             out,
-                            [q_tile, head_dim_cfg],  # type: ignore[reportArgumentType]
+                            [q_tile, head_dim_cfg],
                             [cur_offset, 0],
                         )
                         # Online softmax update via shared module-level InCore kernel
                         mi_update, li_update, oi, out_view = kernel_online_update(
-                            mi, li, oi_tmp, mi_update, li_update, oi, out_view, is_first, is_last
+                            mi, li, oi_tmp, mi_update, li_update, oi, out_view_buf, is_first, is_last
                         )
 
             return out
@@ -477,11 +491,6 @@ def build_tensor_specs(
         0, max(block_table_flat_size, 1), size=(batch, max_num_blocks_per_req), dtype=torch.int32
     ).flatten()
 
-    # Byte sizes: BF16 tensors use 2 bytes per element
-    size_query = torch.tensor([query_rows * head_dim * 2], dtype=torch.int64)
-    size_key_cache = torch.tensor([key_cache_rows * head_dim * 2], dtype=torch.int64)
-    size_value_cache = torch.tensor([key_cache_rows * head_dim * 2], dtype=torch.int64)
-
     return [
         TensorSpec("query", [query_rows, head_dim], torch.bfloat16, init_value=torch.randn),
         TensorSpec("key_cache", [key_cache_rows, head_dim], torch.bfloat16, init_value=torch.randn),
@@ -490,9 +499,6 @@ def build_tensor_specs(
         TensorSpec("context_lens", [batch], torch.int32, init_value=context_lens_data),
         TensorSpec("out", [query_rows, head_dim], torch.float32, is_output=True),
         TensorSpec("config", [7], torch.int64, init_value=config_data),
-        TensorSpec("size_query", [1], torch.int64, init_value=size_query),
-        TensorSpec("size_key_cache", [1], torch.int64, init_value=size_key_cache),
-        TensorSpec("size_value_cache", [1], torch.int64, init_value=size_value_cache),
     ]
 
 

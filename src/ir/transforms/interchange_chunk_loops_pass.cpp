@@ -27,6 +27,7 @@
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
+#include "pypto/ir/transforms/utils/auto_name_utils.h"
 
 namespace pypto {
 namespace ir {
@@ -104,6 +105,46 @@ static bool ContainsComputeTensorOp(const StmtPtr& stmt) {
   return detector.Found();
 }
 
+/// Detects whether an expression tree contains any sub-expression with TensorType or TileType.
+class TensorOrTileTypedExprDetector : public IRVisitor {
+ public:
+  [[nodiscard]] bool Found() const { return found_; }
+
+  void VisitExpr(const ExprPtr& expr) override {
+    if (!expr || found_) return;
+    auto type = expr->GetType();
+    if (type) {
+      auto kind = type->GetKind();
+      if (kind == ObjectKind::TensorType || kind == ObjectKind::TileType) {
+        found_ = true;
+        return;
+      }
+    }
+    IRVisitor::VisitExpr(expr);
+  }
+
+ private:
+  bool found_ = false;
+};
+
+/// Returns true if stmt is an AssignStmt with a scalar-typed target variable
+/// and a value expression that involves no tensor/tile data.
+static bool IsPureScalarAssignment(const StmtPtr& stmt) {
+  if (!stmt) return false;
+
+  auto kind = stmt->GetKind();
+  if (kind == ObjectKind::AssignStmt) {
+    auto assign = std::static_pointer_cast<const AssignStmt>(stmt);
+    auto var_type = assign->var_->GetType();
+    if (!var_type || var_type->GetKind() != ObjectKind::ScalarType) return false;
+    TensorOrTileTypedExprDetector detector;
+    detector.VisitExpr(assign->value_);
+    return !detector.Found();
+  }
+
+  return false;
+}
+
 static bool ContainsChunkLoop(const StmtPtr& stmt) {
   if (!stmt) return false;
 
@@ -136,8 +177,10 @@ static bool ContainsChunkLoop(const StmtPtr& stmt) {
  * - compute tensor ops
  * - chunk loops that failed interchange or remain sequential
  *
- * Pure host-side groups such as a lone tensor.assemble/create/slice should stay
- * in orchestration rather than becoming tiny outlined InCore functions.
+ * The following stay in orchestration (not wrapped):
+ * - Pure host-side groups (tensor.assemble/create/slice)
+ * - Pure scalar assignments (e.g., index arithmetic like `offset = ob * 32`)
+ *   whose value expression contains no tensor/tile-typed sub-expressions
  */
 static bool NeedsInCoreWrapping(const StmtPtr& stmt) {
   if (!stmt) return false;
@@ -145,6 +188,7 @@ static bool NeedsInCoreWrapping(const StmtPtr& stmt) {
   auto kind = stmt->GetKind();
   if (kind == ObjectKind::YieldStmt || kind == ObjectKind::ReturnStmt) return false;
   if (ContainsInCoreScope(stmt)) return false;
+  if (IsPureScalarAssignment(stmt)) return false;
 
   return ContainsChunkLoop(stmt) || ContainsComputeTensorOp(stmt);
 }
@@ -574,8 +618,14 @@ class InterchangeChunkLoopsMutator : public IRMutator {
       const auto& orig_loop = reordered[loop_idx];
       for (size_t ia_idx = 0; ia_idx < num_iter_args; ++ia_idx) {
         const auto& orig_ia = first_orig->iter_args_[ia_idx];
-        std::string ia_name = orig_ia->name_hint_ + "_l" + std::to_string(loop_idx);
-        std::string rv_name = orig_ia->name_hint_ + "_l" + std::to_string(loop_idx) + "_rv";
+        auto parsed_name = auto_name::Parse(orig_ia->name_hint_);
+        std::string loop_qualifier = auto_name::LoopLevelQualifier(static_cast<int>(loop_idx));
+        std::string combined_qualifier =
+            parsed_name.qualifier.empty() ? loop_qualifier : parsed_name.qualifier + "_" + loop_qualifier;
+        std::string ia_name =
+            auto_name::BuildName(parsed_name.base_name, combined_qualifier, "iter", parsed_name.version);
+        std::string rv_name =
+            auto_name::BuildName(parsed_name.base_name, combined_qualifier, "rv", parsed_name.version);
 
         ExprPtr init_value;
         if (loop_idx == 0) {

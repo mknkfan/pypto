@@ -90,10 +90,10 @@ class DynShapeAddTestCase(PTOTestCase):
                 self,
                 a: pl.Tensor[[rows, cols], pl.FP32],
                 b: pl.Tensor[[rows, cols], pl.FP32],
+                c: pl.Out[pl.Tensor[[rows, cols], pl.FP32]],
             ) -> pl.Tensor[[rows, cols], pl.FP32]:
-                c: pl.Tensor[[rows, cols], pl.FP32] = pl.create_tensor([rows, cols], dtype=pl.FP32)
-                c = self.add_kernel(a, b, c)
-                return c
+                c_out = self.add_kernel(a, b, c)
+                return c_out
 
         return DynShapeAddProgram
 
@@ -173,8 +173,8 @@ class ValidShapeAddTestCase(PTOTestCase):
                 a: pl.Tensor[[rows, cols], pl.FP32],
                 b: pl.Tensor[[rows, cols], pl.FP32],
                 vs: pl.Tensor[[2], pl.INDEX],
+                c: pl.Out[pl.Tensor[[rows, cols], pl.FP32]],
             ) -> pl.Tensor[[rows, cols], pl.FP32]:
-                c: pl.Tensor[[rows, cols], pl.FP32] = pl.create_tensor([rows, cols], dtype=pl.FP32)
                 m: pl.Scalar[pl.INDEX] = pl.tensor.read(vs, [0])
                 n: pl.Scalar[pl.INDEX] = pl.tensor.read(vs, [1])
                 c = self.add_kernel(a, b, c, m, n)
@@ -248,10 +248,10 @@ class LoopDynShapeAddTestCase(PTOTestCase):
                 self,
                 a: pl.Tensor[[rows, cols], pl.FP32],
                 b: pl.Tensor[[rows, cols], pl.FP32],
+                c: pl.Out[pl.Tensor[[rows, cols], pl.FP32]],
             ) -> pl.Tensor[[rows, cols], pl.FP32]:
-                c: pl.Tensor[[rows, cols], pl.FP32] = pl.create_tensor([rows, cols], dtype=pl.FP32)
-                c = self.add_kernel(a, b, c)
-                return c
+                c_out = self.add_kernel(a, b, c)
+                return c_out
 
         return LoopDynShapeAddProgram
 

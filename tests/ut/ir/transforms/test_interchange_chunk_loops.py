@@ -182,17 +182,14 @@ class TestNestedChunkChainsInitSubstitution:
         After = passes.interchange_chunk_loops()(Before)
         after_str = python_print(After)
 
-        # The _inner suffix comes from SplitChunkedLoops for the inner loop's
-        # iter_arg. After InterchangeChunkLoops, these should be rewritten to
-        # _l<N> names. No raw _inner references should remain as init_values.
+        # SplitChunkedLoops introduces `ci` qualifiers for inner-loop
+        # index vars. After InterchangeChunkLoops, init_values should reference
+        # rewritten loop-threaded iter args, not the pre-interchange chunk-inner
+        # iter names.
         lines = after_str.split("\n")
         for line in lines:
-            if "init_values" in line and "_inner" in line:
-                # _inner names must NOT appear as bare init_values — they should
-                # have been substituted to _l<N> names by the interchange pass
-                assert "_inner_l" in line or "_inner_rv" in line or "_inner" not in line, (
-                    f"Dangling _inner reference in init_values: {line.strip()}"
-                )
+            if "init_values" in line:
+                assert "__ci_iter_" not in line, f"Dangling chunk-inner iter in init_values: {line.strip()}"
 
     def test_nested_chains_outline_no_crash(self):
         """Nested parallel chunk chains followed by OutlineIncoreScopes must not crash.
@@ -667,6 +664,69 @@ class TestNonChunkStatementsWrapping:
         assert "auto_incore" not in after_str
         # Both the interchanged chunk's inner and sequential chunk should have incore
         assert after_str.count("pl.incore()") >= 2
+
+
+class TestScalarAssignmentNotWrapped:
+    """Tests that pure scalar assignments stay outside InCore scopes."""
+
+    def test_scalar_assign_adjacent_to_compute_not_wrapped(self):
+        """Scalar assignment adjacent to tensor compute ops should stay in orchestration."""
+
+        @pl.program
+        class Input:
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                with pl.auto_incore():
+                    for ob in pl.range(0, 8):
+                        offset: pl.Scalar[pl.INDEX] = ob * 4  # noqa: F841
+                        x = pl.add(x, 1.0)
+                        for i in pl.parallel(0, 8, 1, chunk=4):
+                            x = pl.add(x, 2.0)
+                return x
+
+        Before = _prepare_for_interchange(Input)
+        After = passes.interchange_chunk_loops()(Before)
+        after_str = python_print(After)
+
+        # The scalar assignment should NOT be inside any pl.incore() scope.
+        scalar_assign_re = re.compile(r"offset\S*\s*:.*=.*\*\s*4")
+        lines = after_str.split("\n")
+        in_incore = False
+        incore_depth = 0
+        for line in lines:
+            stripped = line.strip()
+            if "pl.incore()" in stripped:
+                in_incore = True
+                incore_depth = len(line) - len(line.lstrip())
+            elif in_incore and stripped and (len(line) - len(line.lstrip())) <= incore_depth:
+                if not stripped.startswith("#"):
+                    in_incore = False
+            if in_incore:
+                assert not scalar_assign_re.search(stripped), (
+                    f"Pure scalar assignment found inside InCore scope: {stripped}"
+                )
+
+    def test_scalar_assign_not_wrapped_outline_no_crash(self):
+        """Scalar assignment stays in orchestration after outline — no undefined variable."""
+
+        @pl.program
+        class Input:
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                with pl.auto_incore():
+                    for ob in pl.range(0, 8):
+                        offset: pl.Scalar[pl.INDEX] = ob * 4  # noqa: F841
+                        for i in pl.parallel(0, 8, 1, chunk=4):
+                            x = pl.add(x, 2.0)
+                return x
+
+        program = _prepare_for_interchange(Input)
+        program = passes.interchange_chunk_loops()(program)
+        # This should not crash with undefined variable references
+        program = passes.outline_incore_scopes()(program)
+
+        incore_funcs = [f for f in program.functions.values() if f.func_type == ir.FunctionType.InCore]
+        assert len(incore_funcs) >= 1
 
 
 class TestEndToEndNoComputeLeaks:

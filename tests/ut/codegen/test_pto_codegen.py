@@ -19,6 +19,8 @@ Tests verify:
 - SSA form with correct variable naming
 """
 
+import re
+
 import pypto.language as pl
 import pytest
 from pypto import DataType, backend, codegen, ir
@@ -147,7 +149,6 @@ def test_pto_codegen_basic_mlir_structure():
             tile_a = pl.load(a, offsets=[0, 0], shapes=[32, 32])
             tile_b = pl.add(tile_a, 1.0)
             pl.store(tile_b, offsets=[0, 0], output_tensor=b)
-            return  # noqa: PLR1711 - DSL requires explicit return to build IR return statement
 
     # Compile with Default strategy (applies necessary passes + codegen)
     pm = PassManager.get_strategy(OptimizationStrategy.Default)
@@ -182,7 +183,6 @@ def test_pto_codegen_tensor_parameters():
             tile_b = pl.load(input_b, offsets=[0, 0], shapes=[32, 32])
             tile_c = pl.mul(tile_a, tile_b)
             pl.store(tile_c, offsets=[0, 0], output_tensor=output)
-            return  # noqa: PLR1711 - DSL requires explicit return to build IR return statement
 
     pm = PassManager.get_strategy(OptimizationStrategy.Default)
     transformed_program = pm.run_passes(TensorParamProgram)
@@ -215,7 +215,6 @@ def test_pto_codegen_alloc_tile():
             tile_b = pl.load(a, offsets=[0, 0], shapes=[32, 32])
             tile_c = pl.mul(tile_a, tile_b)
             pl.store(tile_c, offsets=[0, 0], output_tensor=b)
-            return  # noqa: PLR1711 - DSL requires explicit return to build IR return statement
 
     pm = PassManager.get_strategy(OptimizationStrategy.Default)
     transformed_program = pm.run_passes(AllocTileProgram)
@@ -272,7 +271,7 @@ def test_pto_codegen_fillpad_shared_memref_uses_single_alloc_tile():
 
     body = ir.SeqStmts(
         [
-            ir.OpStmts(
+            ir.SeqStmts(
                 [
                     ir.AssignStmt(load_tile, load_call, span),
                     ir.AssignStmt(padded_tile, fillpad_call, span),
@@ -311,6 +310,49 @@ def test_pto_codegen_fillpad_shared_memref_uses_single_alloc_tile():
     assert "pad=0>" not in alloc_lines[0], f"Expected fillpad pad metadata to be preserved: {alloc_lines[0]}"
 
 
+def test_pto_codegen_dynamic_valid_shape_scalar_defined_in_body():
+    """Dynamic valid_shape scalars defined in-body should still reach alloc_tile."""
+
+    backend.reset_for_testing()
+    backend.set_backend_type(BackendType.Ascend910B_PTO)
+
+    @pl.program
+    class DynamicValidShapeScalarProgram:
+        @pl.function(type=pl.FunctionType.InCore)
+        def body_valid_shape(
+            self,
+            input: pl.Tensor[[1, 120], pl.FP32],
+            ctx_len: pl.Scalar[pl.INDEX],
+            output: pl.Tensor[[1, 120], pl.FP32],
+        ) -> pl.Tensor[[1, 120], pl.FP32]:
+            valid_len: pl.Scalar[pl.INDEX] = ctx_len + 0
+            tile: pl.Tile[[1, 120], pl.FP32] = pl.tile.load(
+                input,
+                [0, 0],
+                [1, 120],
+                [1, valid_len],
+                target_memory=pl.MemorySpace.Vec,
+                transpose=False,
+            )
+            result: pl.Tensor[[1, 120], pl.FP32] = pl.tile.store(tile, [0, 0], output)
+            return result
+
+    pm = PassManager.get_strategy(OptimizationStrategy.Default)
+    transformed_program = pm.run_passes(DynamicValidShapeScalarProgram)
+
+    codegen_inst = PTOCodegen()
+    mlir_code = _get_mlir_code(codegen_inst.generate(transformed_program))
+    alloc_lines = [line.strip() for line in mlir_code.splitlines() if "pto.alloc_tile" in line]
+
+    assert len(alloc_lines) == 1, f"Expected one alloc_tile, got: {alloc_lines}"
+    assert "valid_col = %" in alloc_lines[0], (
+        f"Expected alloc_tile to reference in-body valid_shape SSA, got: {alloc_lines[0]}"
+    )
+    assert "valid_col = %arg" not in alloc_lines[0], (
+        f"Expected valid_shape SSA from body, not direct arg reuse: {alloc_lines[0]}"
+    )
+
+
 def test_pto_codegen_tile_load_lowering():
     """Test that tile.load generates partition_view + tload."""
     backend.reset_for_testing()
@@ -322,7 +364,6 @@ def test_pto_codegen_tile_load_lowering():
         def load_test(self, input: pl.Tensor[[64, 64], pl.FP32], output: pl.Tensor[[64, 64], pl.FP32]):
             tile = pl.load(input, offsets=[0, 0], shapes=[32, 32])
             pl.store(tile, offsets=[0, 0], output_tensor=output)
-            return  # noqa: PLR1711 - DSL requires explicit return to build IR return statement
 
     pm = PassManager.get_strategy(OptimizationStrategy.Default)
     transformed_program = pm.run_passes(LoadProgram)
@@ -354,7 +395,6 @@ def test_pto_codegen_tile_store_lowering():
         def store_test(self, input: pl.Tensor[[32, 32], pl.FP32], output: pl.Tensor[[32, 32], pl.FP32]):
             tile = pl.load(input, offsets=[0, 0], shapes=[32, 32])
             pl.store(tile, offsets=[0, 0], output_tensor=output)
-            return  # noqa: PLR1711 - DSL requires explicit return to build IR return statement
 
     pm = PassManager.get_strategy(OptimizationStrategy.Default)
     transformed_program = pm.run_passes(StoreProgram)
@@ -386,7 +426,6 @@ def test_pto_codegen_tile_mul():
             tile_b = pl.load(b, offsets=[0, 0], shapes=[32, 32])
             tile_c = pl.mul(tile_a, tile_b)
             pl.store(tile_c, offsets=[0, 0], output_tensor=c)
-            return  # noqa: PLR1711 - DSL requires explicit return to build IR return statement
 
     pm = PassManager.get_strategy(OptimizationStrategy.Default)
     transformed_program = pm.run_passes(MulProgram)
@@ -412,7 +451,6 @@ def test_pto_codegen_tile_adds():
             tile_a = pl.load(a, offsets=[0, 0], shapes=[32, 32])
             tile_b = pl.add(tile_a, 3.14)
             pl.store(tile_b, offsets=[0, 0], output_tensor=b)
-            return  # noqa: PLR1711 - DSL requires explicit return to build IR return statement
 
     pm = PassManager.get_strategy(OptimizationStrategy.Default)
     transformed_program = pm.run_passes(AddsProgram)
@@ -439,7 +477,6 @@ def test_pto_codegen_constants():
         def const_test(self, a: pl.Tensor[[32, 32], pl.FP32], b: pl.Tensor[[32, 32], pl.FP32]):
             tile_a = pl.load(a, offsets=[0, 0], shapes=[32, 32])
             pl.store(tile_a, offsets=[0, 0], output_tensor=b)
-            return  # noqa: PLR1711 - DSL requires explicit return to build IR return statement
 
     pm = PassManager.get_strategy(OptimizationStrategy.Default)
     transformed_program = pm.run_passes(ConstantProgram)
@@ -471,7 +508,6 @@ def test_pto_codegen_ssa_naming():
             tile_b = pl.load(b, offsets=[0, 0], shapes=[32, 32])
             tile_c = pl.mul(tile_a, tile_b)
             pl.store(tile_c, offsets=[0, 0], output_tensor=c)
-            return  # noqa: PLR1711 - DSL requires explicit return to build IR return statement
 
     pm = PassManager.get_strategy(OptimizationStrategy.Default)
     transformed_program = pm.run_passes(SSAProgram)
@@ -497,7 +533,6 @@ def test_pto_codegen_code_generation_order():
         def order_test(self, a: pl.Tensor[[32, 32], pl.FP32], b: pl.Tensor[[32, 32], pl.FP32]):
             tile = pl.load(a, offsets=[0, 0], shapes=[32, 32])
             pl.store(tile, offsets=[0, 0], output_tensor=b)
-            return  # noqa: PLR1711 - DSL requires explicit return to build IR return statement
 
     pm = PassManager.get_strategy(OptimizationStrategy.Default)
     transformed_program = pm.run_passes(OrderProgram)
@@ -530,13 +565,11 @@ def test_pto_codegen_multiple_functions():
         def func1(self, a: pl.Tensor[[32, 32], pl.FP32], b: pl.Tensor[[32, 32], pl.FP32]):
             tile = pl.load(a, offsets=[0, 0], shapes=[32, 32])
             pl.store(tile, offsets=[0, 0], output_tensor=b)
-            return  # noqa: PLR1711 - DSL requires explicit return to build IR return statement
 
         @pl.function(type=pl.FunctionType.InCore)
         def func2(self, x: pl.Tensor[[32, 32], pl.FP32], y: pl.Tensor[[32, 32], pl.FP32]):
             tile = pl.load(x, offsets=[0, 0], shapes=[32, 32])
             pl.store(tile, offsets=[0, 0], output_tensor=y)
-            return  # noqa: PLR1711 - DSL requires explicit return to build IR return statement
 
     pm = PassManager.get_strategy(OptimizationStrategy.Default)
     transformed_program = pm.run_passes(MultiFunc)
@@ -560,7 +593,6 @@ def test_pto_codegen_reusability():
         def test_func(self, a: pl.Tensor[[32, 32], pl.FP32], b: pl.Tensor[[32, 32], pl.FP32]):
             tile = pl.load(a, offsets=[0, 0], shapes=[32, 32])
             pl.store(tile, offsets=[0, 0], output_tensor=b)
-            return  # noqa: PLR1711 - DSL requires explicit return to build IR return statement
 
     pm = PassManager.get_strategy(OptimizationStrategy.Default)
     transformed_program = pm.run_passes(ReusableProgram)
@@ -639,17 +671,17 @@ class TestGenerateArgUnpacking:
     def test_dynamic_tensor_extracts_shapes_dims(self):
         func = _get_dyn_incore_func()
         code, names = _generate_arg_unpacking(func)
-        # TH is dim 0 of first tensor a_0 — read from a_0_tensor->shapes[0]
-        assert "a_0_tensor->shapes[0]" in code
+        # TH is dim 0 of first tensor a__ssa_v0 — read from a__ssa_v0_tensor->shapes[0]
+        assert "a__ssa_v0_tensor->shapes[0]" in code
         assert "int64_t TH" in code
-        # TW is dim 1 of first tensor a_0 — read from a_0_tensor->shapes[1]
-        assert "a_0_tensor->shapes[1]" in code
+        # TW is dim 1 of first tensor a__ssa_v0 — read from a__ssa_v0_tensor->shapes[1]
+        assert "a__ssa_v0_tensor->shapes[1]" in code
         assert "int64_t TW" in code
         # dynamic dims appended after tensor params
-        assert names == ["a_0", "b_0", "output_0", "TH", "TW"]
+        assert names == ["a__ssa_v0", "b__ssa_v0", "output__ssa_v0", "TH", "TW"]
 
     def test_dynamic_tensor_deduplicates_vars(self):
-        # TH and TW each appear in a_0, b_0, and output_0 but should be extracted only once
+        # TH and TW each appear in a__ssa_v0, b__ssa_v0, and output__ssa_v0 but should be extracted only once
         func = _get_dyn_incore_func()
         code, names = _generate_arg_unpacking(func)
         assert code.count("int64_t TH") == 1
@@ -691,14 +723,14 @@ class TestGenerateKernelWrapper:
     def test_dynamic_shape_forward_call_includes_dims(self):
         func = _get_dyn_incore_func()
         wrapper = _generate_kernel_wrapper(func, SAMPLE_PTOAS_OUTPUT)
-        # Forward call must include dynamic dims TH and TW after tensor args (SSA-renamed with _0 suffix)
-        assert "dyn_func(a_0, b_0, output_0, TH, TW);" in wrapper
+        # Forward call must include dynamic dims TH and TW after tensor args.
+        assert "dyn_func(a__ssa_v0, b__ssa_v0, output__ssa_v0, TH, TW);" in wrapper
 
     def test_dynamic_shape_shapes_extraction_in_wrapper(self):
         func = _get_dyn_incore_func()
         wrapper = _generate_kernel_wrapper(func, SAMPLE_PTOAS_OUTPUT)
-        assert "a_0_tensor->shapes[0]" in wrapper
-        assert "a_0_tensor->shapes[1]" in wrapper
+        assert "a__ssa_v0_tensor->shapes[0]" in wrapper
+        assert "a__ssa_v0_tensor->shapes[1]" in wrapper
 
 
 class TestGenerateSkipPtoas:
@@ -994,6 +1026,107 @@ def test_pto_codegen_repairs_row_sum_add_layout_mismatch():
         f"Expected row-major operands/results after repair, got: {tadd_lines[0]}"
     )
     assert "rows=1, cols=16" in tadd_lines[0], f"Expected repaired row-vector add, got: {tadd_lines[0]}"
+
+
+def test_pto_codegen_keeps_loop_carried_tile_distinct_from_reshape_result():
+    """Loop-carried tile and reshape result must not collapse to one SSA mapping."""
+
+    backend.reset_for_testing()
+    backend.set_backend_type(BackendType.Ascend910B_PTO)
+
+    @pl.program
+    class LoopReshapeRepairProgram:
+        @pl.function(type=pl.FunctionType.InCore)
+        def repro(
+            self,
+            data: pl.Tensor[[16, 512], pl.FP32],
+            out: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
+        ) -> pl.Tensor[[16, 1], pl.FP32]:
+            acc_tile: pl.Tile[[16, 1], pl.FP32] = pl.tile.create(
+                [16, 1], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
+            )
+            acc_row_major_seed: pl.Tile[[1, 16], pl.FP32] = pl.tile.reshape(acc_tile, [1, 16])
+            zero_row_major: pl.Tile[[1, 16], pl.FP32] = pl.tile.muls(acc_row_major_seed, 0.0)
+            init_tile: pl.Tile[[16, 1], pl.FP32] = pl.tile.reshape(zero_row_major, [16, 1])
+            for i, (acc_iter,) in pl.range(2, init_values=(init_tile,)):
+                offset: pl.Scalar[pl.INDEX] = i * 256
+                chunk: pl.Tile[[16, 256], pl.FP32] = pl.load(data, [0, offset], [16, 256])
+                tmp: pl.Tile[[16, 256], pl.FP32] = pl.tile.create(
+                    [16, 256], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
+                )
+                partial: pl.Tile[[16, 1], pl.FP32] = pl.tile.row_sum(chunk, tmp)
+                acc_row_major: pl.Tile[[1, 16], pl.FP32] = pl.tile.reshape(acc_iter, [1, 16])
+                partial_row_major: pl.Tile[[1, 16], pl.FP32] = pl.tile.reshape(partial, [1, 16])
+                updated_row_major: pl.Tile[[1, 16], pl.FP32] = pl.tile.add(acc_row_major, partial_row_major)
+                updated: pl.Tile[[16, 1], pl.FP32] = pl.tile.reshape(updated_row_major, [16, 1])
+                result = pl.yield_(updated)
+            final: pl.Tensor[[16, 1], pl.FP32] = pl.store(result, [0, 0], out)
+            return final
+
+    pm = PassManager.get_strategy(OptimizationStrategy.Default)
+    transformed_program = pm.run_passes(LoopReshapeRepairProgram)
+
+    codegen_inst = PTOCodegen()
+    mlir_code = _get_mlir_code(codegen_inst.generate(transformed_program))
+    lines = [line.strip() for line in mlir_code.split("\n")]
+
+    reshape_lines = [line for line in lines if " = pto.treshape " in line]
+    assert reshape_lines, "Expected at least one pto.treshape"
+
+    tadd_lines = [line for line in lines if line.startswith("pto.tadd ")]
+    assert len(tadd_lines) == 1, f"Expected exactly one pto.tadd, got: {tadd_lines}"
+
+    tadd_line = tadd_lines[0]
+
+    reshape_infos = []
+    for reshape_line in reshape_lines:
+        reshape_match = re.match(
+            r"(%[\w.$]+)\s*=\s*pto\.treshape\s+(%[\w.$]+)\s*:\s*(.+?)\s*->\s*(.+)", reshape_line
+        )
+        assert reshape_match is not None, f"Unable to parse reshape: {reshape_line}"
+        reshape_infos.append(
+            {
+                "result": reshape_match.group(1),
+                "src": reshape_match.group(2),
+                "src_type": reshape_match.group(3),
+                "dst_type": reshape_match.group(4),
+            }
+        )
+
+    tadd_match = re.search(r"outs\((%[\w.$]+)\s*:", tadd_line)
+    assert tadd_match is not None, f"Unable to parse tadd outs: {tadd_line}"
+    tadd_out = tadd_match.group(1)
+
+    reshape_back_results = {
+        info
+        for info in [
+            reshape["result"]
+            for reshape in reshape_infos
+            if "rows=1, cols=16" in reshape["src_type"] and "rows=16, cols=1" in reshape["dst_type"]
+        ]
+    }
+
+    loop_carried_reshapes = [
+        info
+        for info in reshape_infos
+        if info["src"] in reshape_back_results
+        and "rows=16, cols=1" in info["src_type"]
+        and "rows=1, cols=16" in info["dst_type"]
+    ]
+    assert loop_carried_reshapes, (
+        "Expected a loop-carried column-vector to row-vector reshape fed by a prior reshape-back SSA, "
+        f"but none matched in: {reshape_lines}"
+    )
+
+    assert all(info["src"] != tadd_out for info in loop_carried_reshapes), (
+        "Loop-carried accumulator must not collapse to the row-major reshape result SSA, "
+        f"but reshape source used tadd out {tadd_out}: {loop_carried_reshapes}"
+    )
+
+    assert all(info["result"] != tadd_out for info in loop_carried_reshapes), (
+        "Reshape result SSA should remain distinct from the tadd output buffer, "
+        f"but reshape result reused {tadd_out}: {loop_carried_reshapes}"
+    )
 
 
 def test_pto_codegen_mixed_scalar_and_tile_iter_args():

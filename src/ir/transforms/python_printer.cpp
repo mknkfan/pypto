@@ -9,6 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -70,6 +71,49 @@ std::string CastModeToString(int mode) {
       return "odd";
     default:
       throw ValueError("Cast round mode must be in range [0, 6], got " + std::to_string(mode));
+  }
+}
+
+template <typename DefNode>
+void BuildRenameMapForDefs(const std::vector<const DefNode*>& defs,
+                           std::unordered_map<const DefNode*, std::string>& rename_map,
+                           bool include_unique_names = false) {
+  rename_map.clear();
+
+  std::vector<const DefNode*> unique_defs;
+  unique_defs.reserve(defs.size());
+  std::unordered_set<const DefNode*> seen_defs;
+  for (const DefNode* def : defs) {
+    if (seen_defs.insert(def).second) unique_defs.push_back(def);
+  }
+
+  std::unordered_map<std::string, int> name_counts;
+  for (const DefNode* def : unique_defs) {
+    name_counts[def->name_hint_]++;
+  }
+
+  // Pre-pass: reserve names that are already unique so suffix generation
+  // for colliding names never picks a reserved name (e.g., defs [M, M, M_1]
+  // must not assign "M_1" to the second M when a real M_1 def exists).
+  std::set<std::string> used_names;
+  for (const DefNode* def : unique_defs) {
+    if (name_counts[def->name_hint_] == 1) {
+      used_names.insert(def->name_hint_);
+      if (include_unique_names) rename_map[def] = def->name_hint_;
+    }
+  }
+
+  for (const DefNode* def : unique_defs) {
+    const std::string& base_name = def->name_hint_;
+    if (name_counts[base_name] == 1) continue;  // Already handled above
+
+    std::string candidate = base_name;
+    int suffix = 0;
+    while (!used_names.insert(candidate).second) {
+      ++suffix;
+      candidate = base_name + "_" + std::to_string(suffix);
+    }
+    rename_map[def] = candidate;
   }
 }
 
@@ -223,7 +267,6 @@ class IRPythonPrinter : public IRVisitor {
   void VisitStmt_(const WhileStmtPtr& op) override;
   void VisitStmt_(const ScopeStmtPtr& op) override;
   void VisitStmt_(const SeqStmtsPtr& op) override;
-  void VisitStmt_(const OpStmtsPtr& op) override;
   void VisitStmt_(const EvalStmtPtr& op) override;
   void VisitStmt_(const BreakStmtPtr& op) override;
   void VisitStmt_(const ContinueStmtPtr& op) override;
@@ -244,6 +287,16 @@ class IRPythonPrinter : public IRVisitor {
   // Built by BuildVarRenameMap() at the start of each function to handle SSA name shadowing.
   std::unordered_map<const Var*, std::string> var_rename_map_;
 
+  // Per-function MemRef name map: MemRef pointer → printed alloc name.
+  // Built from tile.alloc definition sites so tile/tensor annotations can refer
+  // to the same named buffers instead of re-printing inline pl.MemRef(...).
+  std::unordered_map<const MemRef*, std::string> memref_rename_map_;
+
+  // Program-level dyn var rename map: Var pointer → disambiguated printed name.
+  // Built once by VisitProgram for dynamic dimension variables used in type annotations.
+  // When two distinct Var* share the same name_hint_, they get unique suffixed names.
+  std::unordered_map<const Var*, std::string> dyn_var_rename_map_;
+
   // Helper methods
   std::string GetIndent() const;
   void IncreaseIndent();
@@ -252,12 +305,20 @@ class IRPythonPrinter : public IRVisitor {
   // Return the printed name for a Var, using rename map if SSA name shadowing occurred.
   std::string GetVarName(const Var* var) const;
 
+  // Return the printed name for a MemRef when it is defined in the current
+  // function (for example by tile.alloc). Falls back to the original hint.
+  std::string GetMemRefName(const MemRef* memref) const;
+
   // Build var_rename_map_ for a function by scanning all Var def-sites in DFS pre-order.
   // Assigns unique suffixed names (e.g., "i", "i_1") when two distinct Vars share a name.
   void BuildVarRenameMap(const FunctionPtr& func);
 
+  // Build memref_rename_map_ for a function from MemRef definition sites
+  // (currently tile.alloc assignments).
+  void BuildMemRefRenameMap(const FunctionPtr& func);
+
   // Print a statement block at current indent level.
-  // SeqStmts/OpStmts are transparent containers - recursed into without extra indent.
+  // SeqStmts is a transparent container - recursed into without extra indent.
   void PrintStmtBlock(const StmtPtr& stmt);
 
   // Statement body visitor with SSA-style handling
@@ -272,6 +333,10 @@ class IRPythonPrinter : public IRVisitor {
 
   // Shape printing helper
   void PrintShapeDims(std::ostringstream& oss, const std::vector<ExprPtr>& shape);
+
+  // Print an expression for use in type annotations (shapes, views).
+  // Uses GetVarName for Var nodes to pick up dyn_var_rename_map_ disambiguation.
+  std::string PrintExprForType(const ExprPtr& expr);
 
   // MemRef and TileView printing helpers
   std::string PrintMemRef(const MemRef& memref);
@@ -423,7 +488,7 @@ void IRPythonPrinter::VisitExpr_(const VarPtr& op) { stream_ << GetVarName(op.ge
 
 void IRPythonPrinter::VisitExpr_(const IterArgPtr& op) { stream_ << op->name_hint_; }
 
-void IRPythonPrinter::VisitExpr_(const MemRefPtr& op) { stream_ << op->name_hint_; }
+void IRPythonPrinter::VisitExpr_(const MemRefPtr& op) { stream_ << GetMemRefName(op.get()); }
 
 void IRPythonPrinter::VisitExpr_(const ConstIntPtr& op) {
   // DEFAULT_CONST_INT (= INT64) and INDEX both represent 64-bit integer constants
@@ -991,25 +1056,11 @@ void IRPythonPrinter::VisitStmt_(const SeqStmtsPtr& op) {
   }
 }
 
-void IRPythonPrinter::VisitStmt_(const OpStmtsPtr& op) {
-  for (size_t i = 0; i < op->stmts_.size(); ++i) {
-    PrintStmtBlock(op->stmts_[i]);
-    if (i < op->stmts_.size() - 1) {
-      stream_ << "\n";
-    }
-  }
-}
-
 void IRPythonPrinter::PrintStmtBlock(const StmtPtr& stmt) {
   if (auto seq = As<SeqStmts>(stmt)) {
     for (size_t i = 0; i < seq->stmts_.size(); ++i) {
       PrintStmtBlock(seq->stmts_[i]);
       if (i < seq->stmts_.size() - 1) stream_ << "\n";
-    }
-  } else if (auto ops = As<OpStmts>(stmt)) {
-    for (size_t i = 0; i < ops->stmts_.size(); ++i) {
-      PrintStmtBlock(ops->stmts_[i]);
-      if (i < ops->stmts_.size() - 1) stream_ << "\n";
     }
   } else {
     stream_ << GetIndent();
@@ -1113,71 +1164,60 @@ static void CollectVarDefsInOrder(const StmtPtr& stmt, std::vector<const Var*>& 
     CollectVarDefsInOrder(while_stmt->body_, out);
   } else if (auto seq = As<SeqStmts>(stmt)) {
     for (auto& s : seq->stmts_) CollectVarDefsInOrder(s, out);
-  } else if (auto ops = As<OpStmts>(stmt)) {
-    for (auto& s : ops->stmts_) CollectVarDefsInOrder(s, out);
   } else if (auto scope = As<ScopeStmt>(stmt)) {
     CollectVarDefsInOrder(scope->body_, out);
+  }
+}
+
+// Collect MemRef definition sites in DFS pre-order for alloc name reuse.
+static void CollectMemRefDefsInOrder(const StmtPtr& stmt, std::vector<const MemRef*>& out) {
+  if (!stmt) return;
+  if (auto assign = As<AssignStmt>(stmt)) {
+    if (auto memref = As<MemRef>(assign->var_)) out.push_back(memref.get());
+  } else if (auto for_stmt = As<ForStmt>(stmt)) {
+    CollectMemRefDefsInOrder(for_stmt->body_, out);
+  } else if (auto if_stmt = As<IfStmt>(stmt)) {
+    CollectMemRefDefsInOrder(if_stmt->then_body_, out);
+    if (if_stmt->else_body_.has_value()) CollectMemRefDefsInOrder(*if_stmt->else_body_, out);
+  } else if (auto while_stmt = As<WhileStmt>(stmt)) {
+    CollectMemRefDefsInOrder(while_stmt->body_, out);
+  } else if (auto seq = As<SeqStmts>(stmt)) {
+    for (auto& s : seq->stmts_) CollectMemRefDefsInOrder(s, out);
+  } else if (auto scope = As<ScopeStmt>(stmt)) {
+    CollectMemRefDefsInOrder(scope->body_, out);
   }
 }
 
 std::string IRPythonPrinter::GetVarName(const Var* var) const {
   auto it = var_rename_map_.find(var);
   if (it != var_rename_map_.end()) return it->second;
+  auto dyn_it = dyn_var_rename_map_.find(var);
+  if (dyn_it != dyn_var_rename_map_.end()) return dyn_it->second;
   return var->name_hint_;
 }
 
-void IRPythonPrinter::BuildVarRenameMap(const FunctionPtr& func) {
-  var_rename_map_.clear();
+std::string IRPythonPrinter::GetMemRefName(const MemRef* memref) const {
+  auto it = memref_rename_map_.find(memref);
+  if (it != memref_rename_map_.end()) return it->second;
+  return memref->name_hint_;
+}
 
+void IRPythonPrinter::BuildVarRenameMap(const FunctionPtr& func) {
   // Collect all Var def-sites in DFS pre-order: params first, then body.
   std::vector<const Var*> defs;
   for (auto& p : func->params_) defs.push_back(p.get());
   if (func->body_) CollectVarDefsInOrder(func->body_, defs);
+  BuildRenameMapForDefs(defs, var_rename_map_);
+}
 
-  // Deduplicate by pointer (same Var object may appear as both param and assign target).
-  {
-    std::unordered_set<const Var*> seen;
-    std::vector<const Var*> unique_defs;
-    for (const Var* v : defs) {
-      if (seen.insert(v).second) unique_defs.push_back(v);
-    }
-    defs = std::move(unique_defs);
-  }
-
-  // Count occurrences of each name across distinct Var objects.
-  std::unordered_map<std::string, int> name_counts;
-  for (const Var* v : defs) name_counts[v->name_hint_]++;
-
-  // Assign printed names: unique names keep their original; duplicate names get suffixes.
-  std::set<std::string> used_names;
-  for (const Var* v : defs) {
-    if (name_counts[v->name_hint_] == 1) {
-      // No conflict — no rename map entry needed (GetVarName falls back to name_).
-      used_names.insert(v->name_hint_);
-    }
-  }
-  for (const Var* v : defs) {
-    if (name_counts[v->name_hint_] == 1) continue;  // Already handled above.
-    std::string candidate = v->name_hint_;
-    if (used_names.find(candidate) == used_names.end()) {
-      used_names.insert(candidate);
-      var_rename_map_[v] = candidate;
-    } else {
-      int suffix = 1;
-      while (true) {
-        candidate = v->name_hint_ + "_" + std::to_string(suffix);
-        if (used_names.find(candidate) == used_names.end()) {
-          used_names.insert(candidate);
-          var_rename_map_[v] = candidate;
-          break;
-        }
-        suffix++;
-      }
-    }
-  }
+void IRPythonPrinter::BuildMemRefRenameMap(const FunctionPtr& func) {
+  std::vector<const MemRef*> defs;
+  if (func->body_) CollectMemRefDefsInOrder(func->body_, defs);
+  BuildRenameMapForDefs(defs, memref_rename_map_, true);
 }
 
 void IRPythonPrinter::VisitFunction(const FunctionPtr& func) {
+  BuildMemRefRenameMap(func);
   // Build rename map for this function to handle SSA name shadowing.
   BuildVarRenameMap(func);
 
@@ -1367,37 +1407,61 @@ static std::vector<std::pair<GlobalVarPtr, FunctionPtr>> TopologicalSortFunction
   return sorted;
 }
 
-static std::set<std::string> CollectDynVarNames(const ProgramPtr& program) {
-  std::set<std::string> dyn_vars;
+static std::unordered_map<const Var*, std::string> CollectDynVarMapping(const ProgramPtr& program) {
+  // Phase 1: Collect all distinct Var* pointers used as dynamic dims,
+  // preserving insertion order for deterministic output.
+  std::vector<const Var*> dyn_var_ptrs;
+  std::unordered_set<const Var*> seen_ptrs;
+
+  auto try_insert = [&](const Var* var) {
+    if (seen_ptrs.insert(var).second) {
+      dyn_var_ptrs.push_back(var);
+    }
+  };
+
+  // Walk an expression tree to find all Var nodes (handles both bare Var dims
+  // and complex expressions like M + 1 where Var is a sub-expression).
+  std::function<void(const ExprPtr&)> collect_vars_from_expr = [&](const ExprPtr& expr) {
+    if (!expr) return;
+    if (auto var = As<Var>(expr)) {
+      try_insert(var.get());
+    } else if (auto bin = As<BinaryExpr>(expr)) {
+      collect_vars_from_expr(bin->left_);
+      collect_vars_from_expr(bin->right_);
+    } else if (auto unary = As<UnaryExpr>(expr)) {
+      collect_vars_from_expr(unary->operand_);
+    }
+  };
+
   std::function<void(const TypePtr&)> collect_from_type = [&](const TypePtr& type) {
     if (auto tensor_type = As<TensorType>(type)) {
       for (const auto& dim : tensor_type->shape_) {
-        if (auto var = As<Var>(dim)) dyn_vars.insert(var->name_hint_);
+        collect_vars_from_expr(dim);
       }
       if (tensor_type->tensor_view_.has_value()) {
         for (const auto& dim : tensor_type->tensor_view_->valid_shape) {
-          if (auto var = As<Var>(dim)) dyn_vars.insert(var->name_hint_);
+          collect_vars_from_expr(dim);
         }
         for (const auto& dim : tensor_type->tensor_view_->stride) {
-          if (auto var = As<Var>(dim)) dyn_vars.insert(var->name_hint_);
+          collect_vars_from_expr(dim);
         }
       }
     } else if (auto tile_type = As<TileType>(type)) {
       for (const auto& dim : tile_type->shape_) {
-        if (auto var = As<Var>(dim)) dyn_vars.insert(var->name_hint_);
+        collect_vars_from_expr(dim);
       }
       if (tile_type->tile_view_.has_value()) {
         for (const auto& dim : tile_type->tile_view_->valid_shape) {
-          if (auto var = As<Var>(dim)) dyn_vars.insert(var->name_hint_);
+          collect_vars_from_expr(dim);
         }
         for (const auto& dim : tile_type->tile_view_->stride) {
-          if (auto var = As<Var>(dim)) dyn_vars.insert(var->name_hint_);
+          collect_vars_from_expr(dim);
         }
-        if (tile_type->tile_view_->start_offset) {
-          if (auto var = As<Var>(tile_type->tile_view_->start_offset)) {
-            dyn_vars.insert(var->name_hint_);
-          }
-        }
+        collect_vars_from_expr(tile_type->tile_view_->start_offset);
+      }
+    } else if (auto tuple_type = As<TupleType>(type)) {
+      for (const auto& elem_type : tuple_type->types_) {
+        collect_from_type(elem_type);
       }
     }
   };
@@ -1433,7 +1497,14 @@ static std::set<std::string> CollectDynVarNames(const ProgramPtr& program) {
       collector.VisitStmt(func->body_);
     }
   }
-  return dyn_vars;
+
+  // Phase 2: Assign unique printed names, disambiguating collisions.
+  // Reuses the same rename logic as BuildVarRenameMap / BuildMemRefRenameMap.
+  // include_unique_names=true so VisitProgram can iterate the full map for
+  // pl.dynamic() declarations.
+  std::unordered_map<const Var*, std::string> result;
+  BuildRenameMapForDefs(dyn_var_ptrs, result, /*include_unique_names=*/true);
+  return result;
 }
 
 void IRPythonPrinter::VisitProgram(const ProgramPtr& program) {
@@ -1447,10 +1518,17 @@ void IRPythonPrinter::VisitProgram(const ProgramPtr& program) {
     stream_ << "from pypto import language as " << prefix_ << "\n\n";
   }
 
-  // Emit pl.dynamic() declarations for dynamic shape variables used in function signatures
-  auto dyn_vars = CollectDynVarNames(program);
-  if (!dyn_vars.empty()) {
-    for (const auto& name : dyn_vars) {
+  // Emit pl.dynamic() declarations for dynamic shape variables used in function signatures.
+  // Uses pointer-identity-aware collection so distinct Var* with the same name_hint_
+  // get disambiguated printed names (issue #618).
+  dyn_var_rename_map_ = CollectDynVarMapping(program);
+  if (!dyn_var_rename_map_.empty()) {
+    // Sort by disambiguated name for deterministic output
+    std::vector<std::pair<const Var*, std::string>> sorted_dyn_vars(dyn_var_rename_map_.begin(),
+                                                                    dyn_var_rename_map_.end());
+    std::sort(sorted_dyn_vars.begin(), sorted_dyn_vars.end(),
+              [](const auto& a, const auto& b) { return a.second < b.second; });
+    for (const auto& [var, name] : sorted_dyn_vars) {
       stream_ << name << " = " << prefix_ << ".dynamic(\"" << name << "\")\n";
     }
     stream_ << "\n";
@@ -1484,21 +1562,30 @@ void IRPythonPrinter::VisitProgram(const ProgramPtr& program) {
   DecreaseIndent();
 }
 
+std::string IRPythonPrinter::PrintExprForType(const ExprPtr& expr) {
+  if (auto const_int = As<ConstInt>(expr)) {
+    return std::to_string(const_int->value_);
+  }
+  if (auto var = As<Var>(expr)) {
+    return GetVarName(var.get());
+  }
+  IRPythonPrinter temp_printer(prefix_);
+  temp_printer.dyn_var_rename_map_ = dyn_var_rename_map_;
+  return temp_printer.Print(expr);
+}
+
 void IRPythonPrinter::PrintShapeDims(std::ostringstream& oss, const std::vector<ExprPtr>& shape) {
   for (size_t i = 0; i < shape.size(); ++i) {
     if (i > 0) oss << ", ";
-    // For ConstInt shape dims, print raw value to avoid dtype annotations
-    if (auto const_int = As<ConstInt>(shape[i])) {
-      oss << const_int->value_;
-    } else {
-      IRPythonPrinter temp_printer(prefix_);
-      oss << temp_printer.Print(shape[i]);
-    }
+    oss << PrintExprForType(shape[i]);
   }
 }
 
 // Helper methods for MemRef and TileView printing
 std::string IRPythonPrinter::PrintMemRef(const MemRef& memref) {
+  auto it = memref_rename_map_.find(&memref);
+  if (it != memref_rename_map_.end()) return it->second;
+
   std::ostringstream oss;
   oss << prefix_ << ".MemRef(";
 
@@ -1545,8 +1632,7 @@ std::string IRPythonPrinter::PrintTileView(const TileView& tile_view,
     oss << "valid_shape=[";
     for (size_t i = 0; i < tile_view.valid_shape.size(); ++i) {
       if (i > 0) oss << ", ";
-      IRPythonPrinter temp_printer(prefix_);
-      oss << temp_printer.Print(tile_view.valid_shape[i]);
+      oss << PrintExprForType(tile_view.valid_shape[i]);
     }
     oss << "]";
   }
@@ -1557,8 +1643,7 @@ std::string IRPythonPrinter::PrintTileView(const TileView& tile_view,
     oss << "stride=[";
     for (size_t i = 0; i < tile_view.stride.size(); ++i) {
       if (i > 0) oss << ", ";
-      IRPythonPrinter temp_printer(prefix_);
-      oss << temp_printer.Print(tile_view.stride[i]);
+      oss << PrintExprForType(tile_view.stride[i]);
     }
     oss << "]";
   }
@@ -1567,8 +1652,7 @@ std::string IRPythonPrinter::PrintTileView(const TileView& tile_view,
   if (tile_view.start_offset) {
     maybe_comma();
     oss << "start_offset=";
-    IRPythonPrinter temp_printer(prefix_);
-    oss << temp_printer.Print(tile_view.start_offset);
+    oss << PrintExprForType(tile_view.start_offset);
   }
 
   // blayout — omit if row_major (default)
@@ -1669,8 +1753,7 @@ std::string IRPythonPrinter::PrintTensorView(const TensorView& tensor_view,
     oss << "valid_shape=[";
     for (size_t i = 0; i < tensor_view.valid_shape.size(); ++i) {
       if (i > 0) oss << ", ";
-      IRPythonPrinter temp_printer(prefix_);
-      oss << temp_printer.Print(tensor_view.valid_shape[i]);
+      oss << PrintExprForType(tensor_view.valid_shape[i]);
     }
     oss << "]";
   }
@@ -1689,8 +1772,7 @@ std::string IRPythonPrinter::PrintTensorView(const TensorView& tensor_view,
   oss << "stride=[";
   for (size_t i = 0; i < tensor_view.stride.size(); ++i) {
     if (i > 0) oss << ", ";
-    IRPythonPrinter temp_printer(prefix_);
-    oss << temp_printer.Print(tensor_view.stride[i]);
+    oss << PrintExprForType(tensor_view.stride[i]);
   }
   oss << "]";
 

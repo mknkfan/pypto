@@ -740,6 +740,19 @@ class TestStrictSSAMode:
 class TestEdgeCases:
     """Tests for edge cases and corner scenarios."""
 
+    def test_reserved_auto_name_delimiter_in_base_raises(self):
+        """Base names containing '__' should be rejected before auto-naming."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, bad__x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                result: pl.Tensor[[64], pl.FP32] = pl.add(bad__x, bad__x)
+                return result
+
+        with pytest.raises(ValueError, match="reserved delimiter '__'"):
+            passes.convert_to_ssa()(Before)
+
     def test_variables_with_numeric_suffixes(self):
         """Variables ending in _<digits> should be treated as distinct (issue #170)."""
 
@@ -803,7 +816,7 @@ class TestEdgeCases:
         class Before:
             @pl.function
             def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
-                unused: pl.Tensor[[64], pl.FP32] = pl.mul(x, 3.0)  # noqa: F841
+                _unused: pl.Tensor[[64], pl.FP32] = pl.mul(x, 3.0)
                 result: pl.Tensor[[64], pl.FP32] = pl.add(x, 1.0)
                 return result
 
@@ -811,7 +824,7 @@ class TestEdgeCases:
         class Expected:
             @pl.function(strict_ssa=True)
             def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
-                unused_0: pl.Tensor[[64], pl.FP32] = pl.mul(x, 3.0)  # noqa: F841
+                _unused_0: pl.Tensor[[64], pl.FP32] = pl.mul(x, 3.0)
                 result_0: pl.Tensor[[64], pl.FP32] = pl.add(x, 1.0)
                 return result_0
 
@@ -1327,8 +1340,8 @@ class TestEscapingVariables:
                 b: pl.Tensor[[128, 128], pl.FP32],
             ) -> pl.Tensor[[128, 128], pl.FP32]:
                 c: pl.Tensor[[128, 128], pl.FP32] = pl.create_tensor([128, 128], dtype=pl.FP32)
-                c = self.add_kernel(a, b, c)
-                return c
+                c_out = self.add_kernel(a, b, c)
+                return c_out
 
         After = passes.convert_to_ssa()(Before)
         passes.run_verifier()(After)
@@ -1461,6 +1474,47 @@ class TestEscapingVariables:
         printed = ir.python_print(After)
         assert "k0_iter" not in printed, "k0 should not be promoted to iter_arg"
         assert "chunk_iter" not in printed, "chunk should not be promoted to iter_arg"
+
+    def test_loop_local_var_not_carried_as_iter_arg(self):
+        """Loop-local variable freshly created each iteration must not be loop-carried.
+
+        Regression test for issue #642: ConvertToSSA incorrectly promoted
+        a variable created inside a loop body to a loop-carry iter_arg.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, x: pl.Tensor[[16, 128], pl.FP32]) -> pl.Tensor[[16, 128], pl.FP32]:
+                result = pl.create_tensor([16, 1], dtype=pl.FP32)
+                result = pl.mul(result, 0.0)
+                for b0 in pl.range(0, 16, 4):
+                    result = pl.mul(result, 2.0)
+                out = pl.mul(result, 2.0)
+
+                # local_var is freshly created each iteration — must NOT
+                # become a loop-carry variable in the outer loop.
+                for b0 in pl.range(0, 16, 4):
+                    local_var = pl.create_tensor([4, 1], dtype=pl.FP32)
+                    local_var = pl.mul(local_var, 0.0)
+                    for kb in pl.range(0, 40):
+                        local_var = pl.add(local_var, 1.0)
+                    _tmp = pl.mul(local_var, 3.0)
+
+                return out
+
+        After = passes.convert_to_ssa()(Before)
+        printed = ir.python_print(After)
+
+        # Count ForStmt lines with init_values — only the first two loops
+        # (outer b0 and inner kb) should carry variables; the second b0
+        # loop should have NO init_values (no loop-carry).
+        for_lines = [ln.strip() for ln in printed.split("\n") if "for " in ln and "pl.range" in ln]
+        assert len(for_lines) == 3, f"Expected 3 for-loops, got {len(for_lines)}"
+        # Second for-b0 loop should not have init_values
+        assert "init_values" not in for_lines[1], (
+            f"Second for-loop should not have init_values: {for_lines[1]}"
+        )
 
 
 if __name__ == "__main__":

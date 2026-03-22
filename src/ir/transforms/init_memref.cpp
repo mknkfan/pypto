@@ -20,6 +20,7 @@
 
 #include "pypto/core/error.h"
 #include "pypto/core/logging.h"
+#include "pypto/ir/core.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
 #include "pypto/ir/kind_traits.h"
@@ -77,24 +78,6 @@ bool IsViewOperation(const std::string& op_name) {
   if (!spec_opt.has_value() || !spec_opt->deduce_output_memory) return false;
 
   return !spec_opt->deduce_output_memory({}).has_value();
-}
-
-// Helper to find the YieldStmt inside a statement body (searches through SeqStmts/OpStmts)
-YieldStmtPtr FindYieldStmt(const StmtPtr& body) {
-  if (auto yield = As<YieldStmt>(body)) return yield;
-  if (auto seq = As<SeqStmts>(body)) {
-    for (const auto& child : seq->stmts_) {
-      auto result = FindYieldStmt(child);
-      if (result) return result;
-    }
-  }
-  if (auto ops = As<OpStmts>(body)) {
-    for (const auto& child : ops->stmts_) {
-      auto result = FindYieldStmt(child);
-      if (result) return result;
-    }
-  }
-  return nullptr;
 }
 
 // Visitor to identify memory space for each variable
@@ -288,7 +271,9 @@ class InitMemRefMutator : public IRMutator {
     auto memref = GetTypeMemRef(new_init->GetType());
     auto old_var_expr = std::static_pointer_cast<const Expr>(old_var);
     auto source_memory_space = ExtractMemorySpaceFromType(new_init->GetType());
-    TypePtr new_type = CloneTypeWithMemRef(old_var_expr->GetType(), memref, source_memory_space);
+    TypePtr new_type = CloneTypeWithMemRefAndRemapExprs(
+        old_var_expr->GetType(), memref, [this](const ExprPtr& expr) { return VisitExpr(expr); },
+        source_memory_space);
 
     return std::make_shared<IterArg>(iter_arg->name_hint_, new_type, new_init, iter_arg->span_);
   }
@@ -301,9 +286,9 @@ class InitMemRefMutator : public IRMutator {
     // Process Type if it is ShapedType (TensorType or TileType)
     if (auto shaped_type = std::dynamic_pointer_cast<const ShapedType>(var_expr->GetType())) {
       auto memref = CreateMemRef(shaped_type, var);
-      new_type =
-          CloneTypeWithMemRef(var_expr->GetType(), memref,
-                              ResolveTileMemorySpace(var_expr->GetType(), var, /*default_to_ddr=*/true));
+      new_type = CloneTypeWithMemRefAndRemapExprs(
+          var_expr->GetType(), memref, [this](const ExprPtr& expr) { return VisitExpr(expr); },
+          ResolveTileMemorySpace(var_expr->GetType(), var, /*default_to_ddr=*/true));
     }
 
     return std::make_shared<Var>(var->name_hint_, new_type, var->span_);
@@ -365,7 +350,9 @@ class InitMemRefMutator : public IRMutator {
           if (shared_memref.has_value()) {
             LOG_DEBUG << "Sharing MemRef from input tile to " << op->var_->name_hint_;
             auto source_memory_space = ExtractMemorySpaceFromType(input_tile_arg->GetType());
-            TypePtr new_type = CloneTypeWithMemRef(op->var_->GetType(), shared_memref, source_memory_space);
+            TypePtr new_type = CloneTypeWithMemRefAndRemapExprs(
+                op->var_->GetType(), shared_memref, [this](const ExprPtr& expr) { return VisitExpr(expr); },
+                source_memory_space);
             VarPtr new_var = std::make_shared<Var>(op->var_->name_hint_, new_type, op->var_->span_);
             var_map_[op->var_] = new_var;
 
@@ -388,8 +375,9 @@ class InitMemRefMutator : public IRMutator {
 
           // Create new variable with the shared MemRef
           if (shared_memref.has_value()) {
-            TypePtr new_type = CloneTypeWithMemRef(op->var_->GetType(), shared_memref,
-                                                   ResolveTileMemorySpace(op->var_->GetType(), op->var_));
+            TypePtr new_type = CloneTypeWithMemRefAndRemapExprs(
+                op->var_->GetType(), shared_memref, [this](const ExprPtr& expr) { return VisitExpr(expr); },
+                ResolveTileMemorySpace(op->var_->GetType(), op->var_));
 
             VarPtr new_var = std::make_shared<Var>(op->var_->name_hint_, new_type, op->var_->span_);
             var_map_[op->var_] = new_var;
@@ -406,33 +394,90 @@ class InitMemRefMutator : public IRMutator {
   }
 
   StmtPtr VisitStmt_(const ForStmtPtr& op) override {
-    // Let the default mutator process iter_args, body, and return_vars
-    auto result = IRMutator::VisitStmt_(op);
-    auto new_for = As<ForStmt>(result);
-    if (!new_for || new_for->iter_args_.empty() || new_for->return_vars_.empty()) {
-      return result;
+    // Manual traversal of ForStmt fields to ensure correct MemRef assignment:
+    // - iter_args inherit MemRef from initValue (via ProcessIterArg)
+    // - return_vars share MemRef with corresponding yield values
+
+    // Step 1: Visit loop bounds and loop_var
+    auto new_loop_var_expr = VisitExpr(op->loop_var_);
+    auto new_loop_var = As<Var>(new_loop_var_expr);
+    INTERNAL_CHECK(new_loop_var) << "Internal error: ForStmt loop_var is not a Var after mutation";
+    auto new_start = VisitExpr(op->start_);
+    auto new_stop = VisitExpr(op->stop_);
+    auto new_step = VisitExpr(op->step_);
+
+    // Step 2: Process iter_args (inherits MemRef from initValue via ProcessIterArg)
+    std::vector<IterArgPtr> new_iter_args;
+    new_iter_args.reserve(op->iter_args_.size());
+    for (const auto& ia : op->iter_args_) {
+      auto new_ia_expr = VisitExpr(ia);
+      auto new_ia =
+          std::dynamic_pointer_cast<const IterArg>(std::static_pointer_cast<const IRNode>(new_ia_expr));
+      INTERNAL_CHECK(new_ia) << "Internal error: ForStmt iter_arg is not an IterArg after mutation";
+      new_iter_args.push_back(new_ia);
     }
 
-    // Make each return_var share the same MemRef as the corresponding iter_arg
-    // (MLIR scf.for requires result types to match iter_arg types)
+    // Register old->new IterArg mappings so body references are substituted
+    for (size_t i = 0; i < op->iter_args_.size(); ++i) {
+      if (new_iter_args[i].get() != op->iter_args_[i].get()) {
+        var_remap_[op->iter_args_[i].get()] = new_iter_args[i];
+      }
+    }
+
+    // Step 3: Visit body
+    auto new_body = VisitStmt(op->body_);
+
+    // Clean up IterArg remappings
+    for (const auto& old_iter_arg : op->iter_args_) {
+      var_remap_.erase(old_iter_arg.get());
+    }
+
+    // Step 4: Visit return_vars
+    std::vector<VarPtr> new_return_vars;
+    new_return_vars.reserve(op->return_vars_.size());
+    for (const auto& rv : op->return_vars_) {
+      auto new_rv_expr = VisitExpr(rv);
+      auto new_rv = As<Var>(new_rv_expr);
+      INTERNAL_CHECK(new_rv) << "Internal error: ForStmt return_var is not a Var after mutation";
+      new_return_vars.push_back(new_rv);
+    }
+
+    // Visit chunk_size if present
+    std::optional<ExprPtr> new_chunk_size = op->chunk_size_;
+    if (op->chunk_size_.has_value()) {
+      new_chunk_size = VisitExpr(*op->chunk_size_);
+    }
+
+    auto new_for = std::make_shared<ForStmt>(new_loop_var, new_start, new_stop, new_step, new_iter_args,
+                                             new_body, new_return_vars, op->span_, op->kind_, new_chunk_size,
+                                             op->chunk_policy_, op->loop_origin_);
+
+    // Step 5: Patch return_vars to share yield value MemRefs.
+    // return_var receives the last yield value, so they must share the same MemRef.
+    auto yield_stmt = FindYieldStmt(new_body);
+    if (!yield_stmt || new_for->iter_args_.empty() || new_for->return_vars_.empty()) {
+      return new_for;
+    }
+
     bool changed = false;
     std::vector<VarPtr> patched_return_vars;
     patched_return_vars.reserve(new_for->return_vars_.size());
 
     for (size_t i = 0; i < new_for->return_vars_.size(); ++i) {
-      if (i >= new_for->iter_args_.size()) {
+      if (i >= yield_stmt->value_.size()) {
         patched_return_vars.push_back(new_for->return_vars_[i]);
         continue;
       }
 
       auto rv_tile = As<TileType>(new_for->return_vars_[i]->GetType());
-      auto ia_tile = As<TileType>(new_for->iter_args_[i]->GetType());
-      if (rv_tile && ia_tile && ia_tile->memref_.has_value()) {
-        auto new_type = CloneTypeWithMemRef(new_for->return_vars_[i]->GetType(), ia_tile->memref_,
-                                            ia_tile->GetMemorySpace());
+      auto yield_var = As<Var>(yield_stmt->value_[i]);
+      auto yield_tile = yield_var ? As<TileType>(yield_var->GetType()) : nullptr;
+      if (rv_tile && yield_tile && yield_tile->memref_.has_value()) {
+        auto new_type = CloneTypeWithMemRefAndRemapExprs(
+            new_for->return_vars_[i]->GetType(), yield_tile->memref_,
+            [this](const ExprPtr& expr) { return VisitExpr(expr); }, yield_tile->GetMemorySpace());
         auto new_rv = std::make_shared<Var>(new_for->return_vars_[i]->name_hint_, new_type,
                                             new_for->return_vars_[i]->span_);
-        // Update the cache so downstream references use the patched var
         var_map_[op->return_vars_[i]] = new_rv;
         patched_return_vars.push_back(new_rv);
         changed = true;
@@ -441,7 +486,7 @@ class InitMemRefMutator : public IRMutator {
       }
     }
 
-    if (!changed) return result;
+    if (!changed) return new_for;
 
     return std::make_shared<ForStmt>(new_for->loop_var_, new_for->start_, new_for->stop_, new_for->step_,
                                      new_for->iter_args_, new_for->body_, std::move(patched_return_vars),
@@ -505,44 +550,30 @@ StmtPtr CreateAllocStatement(const MemRefPtr& memref, MemorySpace memory_space) 
   return std::make_shared<AssignStmt>(memref, alloc_call, Span::unknown());
 }
 
-// Insert alloc statements at the beginning of the first OpStmts in a SeqStmts body
+// Insert alloc statements at the beginning of a function body.
 StmtPtr InsertAllocsIntoBody(const StmtPtr& body, const std::vector<StmtPtr>& alloc_stmts) {
   if (alloc_stmts.empty()) return body;
 
-  auto seq = As<SeqStmts>(body);
-  if (!seq || seq->stmts_.empty()) return body;
-
   std::vector<StmtPtr> new_seq_stmts;
-  bool inserted = false;
+  new_seq_stmts.insert(new_seq_stmts.end(), alloc_stmts.begin(), alloc_stmts.end());
 
-  for (const auto& child : seq->stmts_) {
-    if (!inserted) {
-      if (auto op_stmts = As<OpStmts>(child)) {
-        // Prepend alloc statements into the first OpStmts
-        std::vector<StmtPtr> merged = alloc_stmts;
-        merged.insert(merged.end(), op_stmts->stmts_.begin(), op_stmts->stmts_.end());
-        new_seq_stmts.push_back(std::make_shared<OpStmts>(merged, child->span_));
-        inserted = true;
-        continue;
-      }
+  const Span& span = body ? body->span_ : alloc_stmts.front()->span_;
+  if (body) {
+    if (auto seq = As<SeqStmts>(body)) {
+      new_seq_stmts.insert(new_seq_stmts.end(), seq->stmts_.begin(), seq->stmts_.end());
+    } else {
+      new_seq_stmts.push_back(body);
     }
-    new_seq_stmts.push_back(child);
   }
 
-  if (!inserted) {
-    // No OpStmts found — create one at the beginning
-    auto new_op_stmts = std::make_shared<OpStmts>(alloc_stmts, Span::unknown());
-    new_seq_stmts.insert(new_seq_stmts.begin(), new_op_stmts);
-  }
-
-  return std::make_shared<SeqStmts>(new_seq_stmts, body->span_);
+  return SeqStmts::Flatten(std::move(new_seq_stmts), span);
 }
 
 /**
  * @brief Initialize MemRef for all variables in a function
  *
  * This transformation:
- * 1. Normalizes statement structure (ensures SeqStmts/OpStmts)
+ * 1. Normalizes statement structure (ensures SeqStmts)
  * 2. Initializes the MemRef field for all Var nodes
  * 3. Creates tile.alloc operations for non-DDR MemRefs (addr=-1, unallocated)
  *
@@ -553,7 +584,7 @@ StmtPtr InsertAllocsIntoBody(const StmtPtr& body, const std::vector<StmtPtr>& al
  * - Non-tile variables -> DDR (default)
  */
 FunctionPtr TransformInitMemRef(const FunctionPtr& func) {
-  // Step 1: Normalize statement structure to ensure SeqStmts/OpStmts
+  // Step 1: Normalize statement structure to ensure SeqStmts
   auto normalized_func = NormalizeStmtStructure(func);
 
   // Step 2: Analyze usage to determine memory space for each variable
@@ -594,7 +625,7 @@ FunctionPtr TransformInitMemRef(const FunctionPtr& func) {
     alloc_stmts.push_back(CreateAllocStatement(memref, memory_space));
   }
 
-  // Step 5: Insert alloc statements into the first OpStmts
+  // Step 5: Insert alloc statements at the beginning of the function body
   auto final_body = InsertAllocsIntoBody(new_body, alloc_stmts);
 
   return std::make_shared<Function>(result_func->name_, new_params, result_func->param_directions_,

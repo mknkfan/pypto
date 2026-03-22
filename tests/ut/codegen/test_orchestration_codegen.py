@@ -16,6 +16,7 @@ import pypto.language as pl
 import pytest
 from pypto import backend, codegen
 from pypto.backend import BackendType
+from pypto.ir.pass_manager import OptimizationStrategy, PassManager
 
 
 def assert_code_equal(actual: str, expected: str) -> None:
@@ -63,10 +64,10 @@ class TestOrchestration:
                 self,
                 a: pl.Tensor[[16, 16], pl.FP32],
                 b: pl.Tensor[[16, 16], pl.FP32],
+                d: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
             ) -> pl.Tensor[[16, 16], pl.FP32]:
                 c: pl.Tensor[[16, 16], pl.FP32] = pl.create_tensor([16, 16], dtype=pl.FP32)
                 c = self.kernel_add(a, b, c)
-                d: pl.Tensor[[16, 16], pl.FP32] = pl.create_tensor([16, 16], dtype=pl.FP32)
                 d = self.kernel_add(c, b, d)
                 return d
 
@@ -212,9 +213,9 @@ class TestOrchestration:
                 t: pl.Tensor[[4, 8], pl.FP32],
                 a: pl.Tensor[[16, 16], pl.FP32],
                 b: pl.Tensor[[16, 16], pl.FP32],
+                result: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
             ) -> pl.Tensor[[16, 16], pl.FP32]:
                 val: pl.Scalar[pl.FP32] = pl.tensor.read(t, [1, 3])  # noqa: F841
-                result: pl.Tensor[[16, 16], pl.FP32] = pl.create_tensor([16, 16], dtype=pl.FP32)
                 result = self.kernel_add(a, b, result)
                 return result
 
@@ -252,8 +253,8 @@ class TestOrchestration:
                 self,
                 a: pl.Tensor[[16, 16], pl.FP32],
                 b: pl.Tensor[[16, 16], pl.FP32],
+                c: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
             ) -> pl.Tensor[[16, 16], pl.FP32]:
-                c: pl.Tensor[[16, 16], pl.FP32] = pl.create_tensor([16, 16], dtype=pl.FP32)
                 c = self.kernel_add(a, b, c)
                 return c
 
@@ -290,10 +291,10 @@ class TestOrchestration:
                 self,
                 a: pl.Tensor[[16, 16], pl.FP32],
                 b: pl.Tensor[[16, 16], pl.FP32],
+                c: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+                d: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
             ) -> tuple[pl.Tensor[[16, 16], pl.FP32], pl.Tensor[[16, 16], pl.FP32]]:
-                c: pl.Tensor[[16, 16], pl.FP32] = pl.create_tensor([16, 16], dtype=pl.FP32)
                 c = self.kernel_add(a, b, c)
-                d: pl.Tensor[[16, 16], pl.FP32] = pl.create_tensor([16, 16], dtype=pl.FP32)
                 d = self.kernel_add(a, b, d)
                 return c, d
 
@@ -371,6 +372,7 @@ class TestOrchestration:
                 self,
                 a: pl.Tensor[[16, 16], pl.FP32],
                 b: pl.Tensor[[16, 16], pl.FP32],
+                f: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
             ) -> pl.Tensor[[16, 16], pl.FP32]:
                 c: pl.Tensor[[16, 16], pl.FP32] = pl.create_tensor([16, 16], dtype=pl.FP32)
                 c = self.kernel_add(a, b, c)
@@ -380,7 +382,6 @@ class TestOrchestration:
                 e = self.kernel_add_scalar(c, 2.0, e)  # type: ignore[reportArgumentType]
                 g: pl.Tensor[[16, 16], pl.FP32] = pl.create_tensor([16, 16], dtype=pl.FP32)
                 g = self.kernel_mul(d, e, g)
-                f: pl.Tensor[[16, 16], pl.FP32] = pl.create_tensor([16, 16], dtype=pl.FP32)
                 f = self.kernel_add(g, c, f)
                 return f
 
@@ -571,11 +572,11 @@ class TestOrchestration:
                 self,
                 a: pl.Tensor[[16, 16], pl.FP32],
                 b: pl.Tensor[[16, 16], pl.FP32],
+                result: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
             ) -> pl.Tensor[[16, 16], pl.FP32]:
                 x: pl.Tensor[[16, 16], pl.FP32] = pl.create_tensor([16, 16], dtype=pl.FP32)
                 y: pl.Tensor[[16, 16], pl.FP32] = pl.create_tensor([16, 16], dtype=pl.FP32)
                 x, y = self.kernel_pair(a, b, x, y)
-                result: pl.Tensor[[16, 16], pl.FP32] = pl.create_tensor([16, 16], dtype=pl.FP32)
                 result = self.kernel_add(x, y, result)
                 return result
 
@@ -625,9 +626,9 @@ class TestOrchestration:
                 self,
                 a: pl.Tensor[[16, 16], pl.FP32],
                 b: pl.Tensor[[16, 16], pl.FP32],
+                x: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+                y: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
             ) -> tuple[pl.Tensor[[16, 16], pl.FP32], pl.Tensor[[16, 16], pl.FP32]]:
-                x: pl.Tensor[[16, 16], pl.FP32] = pl.create_tensor([16, 16], dtype=pl.FP32)
-                y: pl.Tensor[[16, 16], pl.FP32] = pl.create_tensor([16, 16], dtype=pl.FP32)
                 x, y = self.kernel_pair(a, b, x, y)
                 return x, y
 
@@ -703,11 +704,11 @@ class TestOrchestration:
                 li_in: pl.Tensor[[16, 1], pl.FP32],
                 oi_in: pl.Tensor[[16, 16], pl.FP32],
                 dst_in: pl.Tensor[[16, 16], pl.FP32],
+                final: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
             ) -> pl.Tensor[[16, 16], pl.FP32]:
                 mi_in, li_in, oi_in, dst_in = self.online_update(
                     mij, lij, oi_new, mi_in, li_in, oi_in, dst_in
                 )
-                final: pl.Tensor[[16, 16], pl.FP32] = pl.create_tensor([16, 16], dtype=pl.FP32)
                 final = self.kernel_add(oi_in, dst_in, final)
                 return final
 
@@ -759,9 +760,9 @@ class TestOrchestration:
             def orch_create(
                 self,
                 a: pl.Tensor[[32, 32], pl.FP16],
+                result: pl.Out[pl.Tensor[[32, 32], pl.FP16]],
             ) -> pl.Tensor[[32, 32], pl.FP16]:
                 buf: pl.Tensor[[32, 32], pl.FP16] = pl.create_tensor([32, 32], dtype=pl.FP16)
-                result: pl.Tensor[[32, 32], pl.FP16] = pl.create_tensor([32, 32], dtype=pl.FP16)
                 result = self.kernel_fill(buf, result)
                 return result
 
@@ -818,16 +819,16 @@ class TestOrchestration:
                 mij: pl.Tensor[[16, 1], pl.FP32],
                 lij: pl.Tensor[[16, 1], pl.FP32],
                 oi_new: pl.Tensor[[16, 16], pl.FP32],
-                mi: pl.Tensor[[16, 1], pl.FP32],
-                li: pl.Tensor[[16, 1], pl.FP32],
-                oi: pl.Tensor[[16, 16], pl.FP32],
+                mi: pl.InOut[pl.Tensor[[16, 1], pl.FP32]],
+                li: pl.InOut[pl.Tensor[[16, 1], pl.FP32]],
+                oi: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+                dst: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
             ) -> tuple[
                 pl.Tensor[[16, 1], pl.FP32],
                 pl.Tensor[[16, 1], pl.FP32],
                 pl.Tensor[[16, 16], pl.FP32],
                 pl.Tensor[[16, 16], pl.FP32],
             ]:
-                dst: pl.Tensor[[16, 16], pl.FP32] = pl.create_tensor([16, 16], dtype=pl.FP32)
                 mi, li, oi, dst = self.online_update(mij, lij, oi_new, mi, li, oi, dst)
                 return mi, li, oi, dst
 
@@ -982,11 +983,11 @@ class TestOrchestration:
                 self,
                 a: pl.Tensor[[64, 128], pl.FP32],
                 b: pl.Tensor[[64, 128], pl.FP32],
+                result: pl.Out[pl.Tensor[[64, 128], pl.FP32]],
             ) -> pl.Tensor[[64, 128], pl.FP32]:
                 d0: pl.Scalar[pl.INT64] = pl.tensor.dim(a, 0)  # noqa: F841
-                result: pl.Tensor[[64, 128], pl.FP32] = pl.create_tensor([64, 128], dtype=pl.FP32)
-                result = self.kernel_add(a, b, result)
-                return result
+                result_out = self.kernel_add(a, b, result)
+                return result_out
 
         generator = codegen.CCECodegen()
         files = generator.generate(TensorDimProgram)
@@ -1270,8 +1271,8 @@ class TestOrchestration:
             def orch_tuple_loop(
                 self,
                 x: pl.Tensor[[16, 16], pl.FP32],
+                a_acc: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
             ) -> pl.Tensor[[16, 16], pl.FP32]:
-                a_acc: pl.Tensor[[16, 16], pl.FP32] = pl.create_tensor([16, 16], dtype=pl.FP32)
                 b_acc: pl.Tensor[[16, 16], pl.FP32] = pl.create_tensor([16, 16], dtype=pl.FP32)
                 # Tuple call BEFORE the loop — makes _tuple_tmp/a_acc/b_acc loop-carried
                 a_acc, b_acc = self.kernel_init(a_acc, b_acc)
@@ -1309,11 +1310,11 @@ class TestOrchestration:
         assert code.count("pto2_rt_submit_aiv_task") == 2
 
     def test_for_loop_with_inplace_return_after_passes(self):
-        """Test inplace detection when return var has compound SSA suffixes from pass pipeline.
+        """Test inplace detection when return var has compound auto-name suffixes from pass pipeline.
 
         When an Opaque function with auto_incore + parallel(chunk=) goes through the full
         pass pipeline (SSA → split_chunked_loops → interchange_chunk_loops → outline), the
-        return var acquires compound suffixes like "_iter_1_outer_l0_rv". GetSSABaseName must
+        return var acquires compound suffixes like "__co_l0_rv_v1". GetSSABaseName must
         strip all of these to match the return var back to the original param name for correct
         inplace detection (2 arg slots, not 3).
         """
@@ -1336,8 +1337,6 @@ class TestOrchestration:
                 return output_tensor
 
         # Run the full pass pipeline to produce compound SSA suffixes
-        from pypto.ir.pass_manager import OptimizationStrategy, PassManager
-
         pm = PassManager.get_strategy(OptimizationStrategy.Default)
         transformed = pm.run_passes(ChunkedInplaceProgram)
 
@@ -1357,6 +1356,67 @@ class TestOrchestration:
         # Task params should use ext_output_tensor (the inplace param), not a separate buffer
         assert "ext_output_tensor)" in code
         assert "ext_output_tensor_iter" not in code
+
+    def test_param_with_numeric_suffix(self):
+        """Regression test for issue #573: params with numeric suffixes must not be collapsed.
+
+        When function params have names like `out_0` and `out_1`,
+        GetSSABaseName previously stripped the numeric suffix, collapsing
+        both to `out`. This caused duplicate ARG_PTR defines and merged
+        external tensors. With VarPtr-based identity, each param retains
+        its distinct identity regardless of name patterns.
+        """
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B_CCE)
+
+        @pl.program
+        class NumericSuffixProgram:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+                out_0: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+                out_1: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> tuple[
+                pl.Tensor[[16, 16], pl.FP32],
+                pl.Tensor[[16, 16], pl.FP32],
+            ]:
+                xt: pl.Tile[[16, 16], pl.FP32] = pl.load(x, [0, 0], [16, 16])
+                r0: pl.Tensor[[16, 16], pl.FP32] = pl.store(xt, [0, 0], out_0)
+                r1: pl.Tensor[[16, 16], pl.FP32] = pl.store(xt, [0, 0], out_1)
+                return r0, r1
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def orch_numeric(
+                self,
+                x: pl.Tensor[[16, 16], pl.FP32],
+                out_0: pl.Tensor[[16, 16], pl.FP32],
+                out_1: pl.Tensor[[16, 16], pl.FP32],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                out_0, out_1 = self.kernel(x, out_0, out_1)
+                return out_0
+
+        generator = codegen.CCECodegen()
+        files = generator.generate(NumericSuffixProgram)
+        code = files["orchestration/orch_numeric.cpp"]
+
+        # Each param must get a distinct ARG_PTR define
+        assert "#define ARG_PTR_X 0" in code
+        assert "#define ARG_PTR_OUT_0 1" in code
+        assert "#define ARG_PTR_OUT_1 2" in code
+
+        # No collapsed "ARG_PTR_OUT" without suffix
+        assert "#define ARG_PTR_OUT " not in code
+
+        # Each param gets its own make_tensor_external
+        assert "ext_out_0" in code
+        assert "ext_out_1" in code
+
+        # 3 tensor params expected
+        assert "expected_arg_count = 3" in code
+
+        # Tuple-return elements must not be collapsed into a single alias
+        assert "Tensor& out =" not in code
 
 
 class TestTensorReadWriteOffsetCodegen:

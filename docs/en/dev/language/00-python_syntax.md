@@ -127,6 +127,8 @@ def func(t: pl.Tensor[[128, 128], pl.FP32], out: pl.Tensor[[128, 128], pl.FP32])
 | `\|` | BitOr | Bitwise |
 | `<<`, `>>` | BitShiftLeft, BitShiftRight | Bitwise |
 
+**Note:** `and`/`or` are parsed from Python's `ast.BoolOp` syntax. Chained expressions like `a and b and c` are folded left-to-right into `And(And(a, b), c)`. Unlike Python, IR `And`/`Or` nodes evaluate both operands (no short-circuit semantics). The corresponding IR factory functions are `ir.and_(lhs, rhs)` and `ir.or_(lhs, rhs)`.
+
 ### Unary Operations and Functions
 
 ```python

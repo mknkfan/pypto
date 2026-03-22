@@ -803,25 +803,6 @@ void BindIR(nb::module_& m) {
       nb::arg("index"), "Get statement by index, supports negative indexing");
   BindFields<SeqStmts>(seq_stmts_class);
 
-  // OpStmts - const shared_ptr
-  auto op_stmts_class = nb::class_<OpStmts, Stmt>(
-      ir, "OpStmts", "Operation statements: a sequence of assignment and/or evaluation statements");
-  op_stmts_class.def(nb::init<const std::vector<StmtPtr>&, const Span&>(), nb::arg("stmts"), nb::arg("span"),
-                     "Create an operation statements");
-  op_stmts_class.def(
-      "__getitem__",
-      [](const std::shared_ptr<const OpStmts>& self, int index) -> StmtPtr {
-        int size = static_cast<int>(self->stmts_.size());
-        if (index < -size || index >= size) {
-          throw pypto::IndexError("OpStmts index " + std::to_string(index) + " out of range [" +
-                                  std::to_string(-size) + ", " + std::to_string(size - 1) + "]");
-        }
-        if (index < 0) index += size;
-        return self->stmts_[index];
-      },
-      nb::arg("index"), "Get statement by index, supports negative indexing");
-  BindFields<OpStmts>(op_stmts_class);
-
   // EvalStmt - const shared_ptr
   auto eval_stmt_class = nb::class_<EvalStmt, Stmt>(ir, "EvalStmt", "Evaluation statement: expr");
   eval_stmt_class.def(nb::init<const ExprPtr&, const Span&>(), nb::arg("expr"), nb::arg("span"),
@@ -1027,6 +1008,10 @@ void BindIR(nb::module_& m) {
   ir.def("bit_not", &MakeBitNot, nb::arg("operand"), nb::arg("span") = Span::unknown(),
          "Bitwise not operator");
   ir.def("not_", &MakeNot, nb::arg("operand"), nb::arg("span") = Span::unknown(), "Logical not operator");
+  ir.def("and_", &MakeAnd, nb::arg("lhs"), nb::arg("rhs"), nb::arg("span") = Span::unknown(),
+         "Logical and operator (lhs and rhs)");
+  ir.def("or_", &MakeOr, nb::arg("lhs"), nb::arg("rhs"), nb::arg("span") = Span::unknown(),
+         "Logical or operator (lhs or rhs)");
   ir.def("min_", &MakeMin, nb::arg("lhs"), nb::arg("rhs"), nb::arg("span") = Span::unknown(),
          "Minimum operator");
   ir.def("max_", &MakeMax, nb::arg("lhs"), nb::arg("rhs"), nb::arg("span") = Span::unknown(),
@@ -1058,7 +1043,7 @@ void BindIR(nb::module_& m) {
       "Args:\n"
       "    func: The function to analyze (can be None, resulting in empty map)\n\n"
       "Parent relationships established:\n"
-      "- For SeqStmts/OpStmts: Each child statement's parent is the SeqStmts/OpStmts\n"
+      "- For SeqStmts: Each child statement's parent is the SeqStmts\n"
       "- For IfStmt: then_body and else_body (if present) have IfStmt as parent\n"
       "- For ForStmt: body has ForStmt as parent\n"
       "- Root statement (function.body) has no parent");

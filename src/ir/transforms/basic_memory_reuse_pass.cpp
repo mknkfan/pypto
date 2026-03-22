@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <any>
 #include <climits>
 #include <cstddef>
 #include <cstdint>
@@ -18,6 +19,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "pypto/core/logging.h"
@@ -110,20 +112,13 @@ void CollectVarUsesFromExprs(const std::vector<ExprPtr>& exprs, const StmtPtr& s
 /**
  * @brief Find the first leaf statement in a statement subtree.
  *
- * Mirrors CollectStmtsInBlock logic: unwraps SeqStmts/OpStmts, skips
+ * Mirrors CollectStmtsInBlock logic: unwraps SeqStmts, skips
  * IfStmt/ForStmt/WhileStmt. Returns nullptr if no leaf is found.
  */
 StmtPtr FindFirstLeafStmt(const StmtPtr& stmt) {
   if (!stmt) return nullptr;
   if (auto seq = As<SeqStmts>(stmt)) {
     for (const auto& sub : seq->stmts_) {
-      auto leaf = FindFirstLeafStmt(sub);
-      if (leaf) return leaf;
-    }
-    return nullptr;
-  }
-  if (auto op_stmts = As<OpStmts>(stmt)) {
-    for (const auto& sub : op_stmts->stmts_) {
       auto leaf = FindFirstLeafStmt(sub);
       if (leaf) return leaf;
     }
@@ -580,8 +575,8 @@ StmtPtr ApplyMemRefSharing(const StmtPtr& stmt, const std::map<VarPtr, VarPtr>& 
         }
 
         // Create new TileType with shared MemRef
-        auto new_tile_type =
-            std::dynamic_pointer_cast<const TileType>(CloneTypeWithMemRef(curr_tile_type, source_memref));
+        auto new_tile_type = std::dynamic_pointer_cast<const TileType>(CloneTypeWithMemRefAndRemapExprs(
+            curr_tile_type, source_memref, [this](const ExprPtr& expr) { return VisitExpr(expr); }));
 
         // Create new Var
         auto new_var = std::make_shared<const Var>(op->var_->name_hint_, new_tile_type, op->var_->span_);
@@ -599,8 +594,10 @@ StmtPtr ApplyMemRefSharing(const StmtPtr& stmt, const std::map<VarPtr, VarPtr>& 
               // Create new Var for shared variable with same reused MemRef
               auto shared_tile_type = As<TileType>(shared_var->GetType());
               if (shared_tile_type) {
-                auto new_shared_tile_type = std::dynamic_pointer_cast<const TileType>(
-                    CloneTypeWithMemRef(shared_tile_type, source_memref));
+                auto new_shared_tile_type =
+                    std::dynamic_pointer_cast<const TileType>(CloneTypeWithMemRefAndRemapExprs(
+                        shared_tile_type, source_memref,
+                        [this](const ExprPtr& expr) { return VisitExpr(expr); }));
                 auto new_shared_var = std::make_shared<const Var>(shared_var->name_hint_,
                                                                   new_shared_tile_type, shared_var->span_);
                 var_substitution_map_[shared_var] = new_shared_var;
@@ -644,6 +641,189 @@ StmtPtr ApplyMemRefSharing(const StmtPtr& stmt, const std::map<VarPtr, VarPtr>& 
   return mutator.VisitStmt(stmt);
 }
 
+/**
+ * @brief Fix ForStmt yield/iter_arg MemRef mismatch after MemoryReuse.
+ *
+ * MemoryReuse may assign different MemRefs to iter_arg and yield value.
+ * Since yield value becomes the next iteration's iter_arg, they must use the
+ * same buffer. When they differ, insert a tile.move before yield to copy the
+ * yield value into the iter_arg's MemRef, and update return_var accordingly.
+ */
+class ForStmtYieldFixupMutator : public IRMutator {
+ public:
+  StmtPtr VisitStmt_(const ForStmtPtr& op) override {
+    // First recurse into nested ForStmts
+    auto result = IRMutator::VisitStmt_(op);
+    auto for_stmt = As<ForStmt>(result);
+    if (!for_stmt || for_stmt->iter_args_.empty()) return result;
+
+    auto yield_stmt = FindYieldStmt(for_stmt->body_);
+    if (!yield_stmt) return result;
+
+    // Check each (iter_arg, yield_value) pair for MemRef mismatch.
+    // Use initValue's MemRef as the target because codegen maps iter_arg to initValue's buffer,
+    // and MemoryReuse may have updated initValue's MemRef without updating iter_arg's.
+    std::vector<std::pair<size_t, VarPtr>> moves_to_insert;  // (index, new_moved_var)
+    std::vector<StmtPtr> move_stmts;
+    for (size_t i = 0; i < yield_stmt->value_.size() && i < for_stmt->iter_args_.size(); ++i) {
+      auto yield_var = As<Var>(yield_stmt->value_[i]);
+      if (!yield_var) continue;
+
+      auto yield_tile = GetTileTypeWithMemRef(yield_var->GetType());
+      if (!yield_tile) continue;
+      auto yield_memref = GetDefinedMemRef(yield_tile);
+
+      // Get the initValue's MemRef (the actual buffer used at runtime)
+      auto init_var = As<Var>(for_stmt->iter_args_[i]->initValue_);
+      if (!init_var) continue;
+      auto init_tile = GetTileTypeWithMemRef(init_var->GetType());
+      if (!init_tile) continue;
+      auto init_memref = GetDefinedMemRef(init_tile);
+
+      if (yield_memref.get() == init_memref.get()) continue;
+
+      // MemRef mismatch — create tile.move to copy yield value into initValue's buffer
+      auto target_memory = init_tile->GetMemorySpace();
+      INTERNAL_CHECK(target_memory.has_value())
+          << "Internal error: initValue TileType must have memory_space";
+
+      auto& op_reg = OpRegistry::GetInstance();
+      std::vector<std::pair<std::string, std::any>> kwargs = {
+          {"target_memory", std::any(target_memory.value())}};
+      auto move_call = op_reg.Create("tile.move", {yield_var}, kwargs, yield_var->span_);
+
+      // Create moved var with initValue's MemRef
+      auto moved_type = CloneTypeWithMemRefAndRemapExprs(
+          yield_var->GetType(), init_memref, [this](const ExprPtr& expr) { return VisitExpr(expr); },
+          target_memory);
+      auto moved_var = std::make_shared<Var>(yield_var->name_hint_ + "_mv", moved_type, yield_var->span_);
+
+      move_stmts.emplace_back(std::make_shared<AssignStmt>(moved_var, move_call, yield_var->span_));
+      moves_to_insert.emplace_back(i, moved_var);
+    }
+
+    if (moves_to_insert.empty()) {
+      // Even without tile.move insertion, iter_arg and return_var may have stale MemRefs
+      // (MemoryReuse updates initValue/yield but not iter_arg/return_var types).
+      // Ensure all 4 loop-carry variables share the same MemRef (= initValue's).
+      return PatchIterArgsAndReturnVars(for_stmt, yield_stmt);
+    }
+
+    // Build new yield values with moved vars substituted
+    std::vector<ExprPtr> new_yield_values = yield_stmt->value_;
+    for (const auto& [idx, moved_var] : moves_to_insert) {
+      new_yield_values[idx] = moved_var;
+    }
+    auto new_yield = std::make_shared<YieldStmt>(new_yield_values, yield_stmt->span_);
+
+    // Insert tile.move stmts before yield and replace yield in body
+    auto new_body = InsertMovesAndReplaceYield(for_stmt->body_, new_yield, move_stmts);
+
+    // Build intermediate ForStmt with new body, then patch iter_args/return_vars
+    auto intermediate_for = std::make_shared<ForStmt>(
+        for_stmt->loop_var_, for_stmt->start_, for_stmt->stop_, for_stmt->step_, for_stmt->iter_args_,
+        new_body, for_stmt->return_vars_, for_stmt->span_, for_stmt->kind_, for_stmt->chunk_size_,
+        for_stmt->chunk_policy_, for_stmt->loop_origin_);
+
+    return PatchIterArgsAndReturnVars(intermediate_for, new_yield);
+  }
+
+ private:
+  // Patch iter_args and return_vars to share initValue's MemRef.
+  // Returns the original ForStmt if no patching is needed.
+  StmtPtr PatchIterArgsAndReturnVars(const ForStmtPtr& for_stmt, const YieldStmtPtr& yield_stmt) {
+    bool changed = false;
+    std::vector<IterArgPtr> new_iter_args = for_stmt->iter_args_;
+    std::vector<VarPtr> new_return_vars = for_stmt->return_vars_;
+
+    for (size_t i = 0; i < for_stmt->iter_args_.size(); ++i) {
+      auto init_var = As<Var>(for_stmt->iter_args_[i]->initValue_);
+      if (!init_var) continue;
+      auto init_tile = GetTileTypeWithMemRef(init_var->GetType());
+      if (!init_tile) continue;
+      auto init_memref = GetDefinedMemRef(init_tile);
+
+      // Patch iter_arg if its MemRef differs from initValue's
+      auto ia_tile = As<TileType>(for_stmt->iter_args_[i]->GetType());
+      if (ia_tile && ia_tile->memref_.has_value()) {
+        auto ia_memref = GetDefinedMemRef(ia_tile);
+        if (ia_memref.get() != init_memref.get()) {
+          auto new_ia_type = CloneTypeWithMemRefAndRemapExprs(
+              ia_tile, init_memref, [this](const ExprPtr& expr) { return VisitExpr(expr); },
+              init_tile->GetMemorySpace());
+          new_iter_args[i] =
+              std::make_shared<IterArg>(for_stmt->iter_args_[i]->name_hint_, new_ia_type,
+                                        for_stmt->iter_args_[i]->initValue_, for_stmt->iter_args_[i]->span_);
+          var_remap_[for_stmt->iter_args_[i].get()] = new_iter_args[i];
+          changed = true;
+        }
+      }
+
+      // Patch return_var to share yield value's MemRef (which should == initValue's after fixup)
+      if (i >= new_return_vars.size() || !yield_stmt || i >= yield_stmt->value_.size()) continue;
+      auto yield_var = As<Var>(yield_stmt->value_[i]);
+      if (!yield_var) continue;
+      auto yield_tile = GetTileTypeWithMemRef(yield_var->GetType());
+      if (!yield_tile) continue;
+      auto yield_memref = GetDefinedMemRef(yield_tile);
+      auto rv_tile = As<TileType>(new_return_vars[i]->GetType());
+      if (!rv_tile || !rv_tile->memref_.has_value()) continue;
+      auto rv_memref = GetDefinedMemRef(rv_tile);
+      if (rv_memref.get() != yield_memref.get()) {
+        auto new_rv_type = CloneTypeWithMemRefAndRemapExprs(
+            rv_tile, yield_memref, [this](const ExprPtr& expr) { return VisitExpr(expr); },
+            yield_tile->GetMemorySpace());
+        new_return_vars[i] =
+            std::make_shared<Var>(new_return_vars[i]->name_hint_, new_rv_type, new_return_vars[i]->span_);
+        // Register old→new so downstream references (e.g., ReturnStmt) are updated
+        var_remap_[for_stmt->return_vars_[i].get()] = new_return_vars[i];
+        changed = true;
+      }
+    }
+
+    if (!changed) return for_stmt;
+
+    auto patched_body = VisitStmt(for_stmt->body_);
+
+    for (const auto& old_iter_arg : for_stmt->iter_args_) {
+      var_remap_.erase(old_iter_arg.get());
+    }
+
+    return std::make_shared<ForStmt>(for_stmt->loop_var_, for_stmt->start_, for_stmt->stop_, for_stmt->step_,
+                                     new_iter_args, patched_body, std::move(new_return_vars), for_stmt->span_,
+                                     for_stmt->kind_, for_stmt->chunk_size_, for_stmt->chunk_policy_,
+                                     for_stmt->loop_origin_);
+  }
+
+  // Replace YieldStmt in body and insert move AssignStmts before it.
+  // Body structure is typically SeqStmts([...assigns..., YieldStmt]).
+  // Move stmts go directly into the SeqStmts before the yield.
+  static StmtPtr InsertMovesAndReplaceYield(const StmtPtr& body, const YieldStmtPtr& new_yield,
+                                            const std::vector<StmtPtr>& move_stmts) {
+    if (As<YieldStmt>(body)) {
+      // Body is just a yield — wrap moves + yield in SeqStmts
+      std::vector<StmtPtr> stmts;
+      stmts.insert(stmts.end(), move_stmts.begin(), move_stmts.end());
+      stmts.push_back(new_yield);
+      return std::make_shared<SeqStmts>(stmts, body->span_);
+    }
+    if (auto seq = As<SeqStmts>(body)) {
+      std::vector<StmtPtr> new_children;
+      for (const auto& child : seq->stmts_) {
+        if (As<YieldStmt>(child)) {
+          // Insert move stmts directly before the new yield
+          new_children.insert(new_children.end(), move_stmts.begin(), move_stmts.end());
+          new_children.push_back(new_yield);
+        } else {
+          new_children.push_back(child);
+        }
+      }
+      return std::make_shared<SeqStmts>(new_children, body->span_);
+    }
+    return body;
+  }
+};
+
 // Collect all MemRef raw pointers currently referenced by TileType variables
 class UsedMemRefCollector : public IRVisitor {
  public:
@@ -670,7 +850,7 @@ bool IsUnusedAllocStmt(const StmtPtr& stmt, const std::set<const MemRef*>& used_
   return used_ptrs.find(memref.get()) == used_ptrs.end();
 }
 
-// Remove unused alloc statements from OpStmts within a SeqStmts body
+// Remove unused alloc statements from a SeqStmts body
 StmtPtr RemoveUnusedAllocStatements(const StmtPtr& body, const std::set<const MemRef*>& used_ptrs) {
   auto seq = As<SeqStmts>(body);
   if (!seq) return body;
@@ -679,28 +859,11 @@ StmtPtr RemoveUnusedAllocStatements(const StmtPtr& body, const std::set<const Me
   bool changed = false;
 
   for (const auto& child : seq->stmts_) {
-    if (auto op_stmts = As<OpStmts>(child)) {
-      std::vector<StmtPtr> filtered;
-      for (const auto& stmt : op_stmts->stmts_) {
-        if (IsUnusedAllocStmt(stmt, used_ptrs)) {
-          changed = true;
-          continue;
-        }
-        filtered.push_back(stmt);
-      }
-      if (filtered.empty()) {
-        changed = true;
-        continue;
-      }
-      if (filtered.size() != op_stmts->stmts_.size()) {
-        new_seq_stmts.push_back(std::make_shared<OpStmts>(filtered, child->span_));
-        changed = true;
-      } else {
-        new_seq_stmts.push_back(child);
-      }
-    } else {
-      new_seq_stmts.push_back(child);
+    if (IsUnusedAllocStmt(child, used_ptrs)) {
+      changed = true;
+      continue;
     }
+    new_seq_stmts.push_back(child);
   }
 
   if (!changed) return body;
@@ -738,14 +901,17 @@ FunctionPtr TransformBasicMemoryReuse(const FunctionPtr& func) {
   // Step 3: Identify reuse opportunities
   auto reuse_map = IdentifyReuseOpportunities(analysis_result.lifetimes);
 
-  if (reuse_map.empty()) {
-    return func;
+  // Step 4: Apply MemRef sharing (skip if no reuse candidates)
+  StmtPtr new_body = func->body_;
+  if (!reuse_map.empty()) {
+    new_body = ApplyMemRefSharing(func->body_, reuse_map, analysis_result.var_sharing_groups);
   }
 
-  // Step 4: Apply MemRef sharing
-  StmtPtr new_body = ApplyMemRefSharing(func->body_, reuse_map, analysis_result.var_sharing_groups);
+  // Step 5: Fix ForStmt yield/iter_arg MemRef mismatches by inserting tile.move
+  ForStmtYieldFixupMutator yield_fixup;
+  new_body = yield_fixup.VisitStmt(new_body);
 
-  // Step 5: Remove alloc statements for MemRefs no longer in use
+  // Step 6: Remove alloc statements for MemRefs no longer in use
   UsedMemRefCollector used_collector;
   used_collector.VisitStmt(new_body);
   new_body = RemoveUnusedAllocStatements(new_body, used_collector.GetUsedPtrs());

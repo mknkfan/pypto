@@ -123,6 +123,33 @@ class TestTileElementwiseOps:
         ir_str = str(Program)
         assert "tile.muls" in ir_str
 
+    def test_tile_muls_preserves_tile_dtype(self):
+        """tile.muls result must keep the tile's element dtype, not promote to the scalar's dtype.
+
+        pto.tmuls requires src and dst to share the same element type, so multiplying a BF16
+        tile by an FP32 scalar must produce a BF16 result (the scalar is narrowed at runtime).
+        """
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tensor[[128, 128], pl.BF16],
+                output: pl.Tensor[[128, 128], pl.BF16],
+            ) -> pl.Tensor[[128, 128], pl.BF16]:
+                tile_a: pl.Tile[[32, 32], pl.BF16] = pl.load(a, [0, 0], [32, 32])
+                # Scalar 0.0 is typed FP32 by default; result must still be BF16.
+                tile_c: pl.Tile[[32, 32], pl.BF16] = pl.mul(tile_a, 0.0)
+                result: pl.Tensor[[128, 128], pl.BF16] = pl.store(tile_c, [0, 0], output)
+                return result
+
+        ir_str = str(Program)
+        assert "tile.muls" in ir_str
+        # Confirm the result tile carries BF16 (pl.BF16 in the Python printer),
+        # not a promoted FP32.  The hardware narrowing happens at runtime.
+        assert "tile_c: pl.Tile[[32, 32], pl.BF16" in ir_str
+
     def test_tile_cmp(self):
         """Test tile.cmp operator - element-wise comparison of two tiles."""
 
