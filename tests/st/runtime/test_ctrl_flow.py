@@ -18,12 +18,11 @@ This module validates code generation and execution for control flow patterns:
 
 Limitations:
     scf.if (if-else) inside InCore functions with tile operations is not yet
-    fully supported at runtime. The BasicMemoryReuse pass does not track
-    variable uses inside IfStmt branches, causing incorrect buffer reuse.
-    Additionally, the PTO codegen's ForStmt/IfStmt type inference only handles
-    ScalarType for iter_args/return_vars (TileType/TensorType fall through to
-    "index"). These limitations also affect break/continue tests since the
-    CtrlFlowTransform pass converts them into if-else + while constructs.
+    fully supported at runtime. The PTO codegen's ForStmt/IfStmt type inference
+    only handles ScalarType for iter_args/return_vars (TileType/TensorType fall
+    through to "index"). These limitations also affect break/continue tests
+    since the CtrlFlowTransform pass converts them into if-else + while
+    constructs.
 """
 
 from typing import Any
@@ -707,21 +706,18 @@ class TestCtrlFlowOperations:
         result = test_runner.run(test_case)
         assert result.passed, f"Test failed: {result.error}"
 
-    @pytest.mark.xfail(reason="InsertSync BUG")
     def test_for_loop_yield_tile_accum(self, test_runner):
         """Test for loop with yield carrying tile accumulator across iterations."""
         test_case = TestForLoopYieldTileAccum()
         result = test_runner.run(test_case)
         assert result.passed, f"Test failed: {result.error}"
 
-    @pytest.mark.xfail(reason="InsertSync BUG")
     def test_if_yield_tensor(self, test_runner):
         """Test if-else with yield carrying tensors."""
         test_case = TestIfYieldTensor()
         result = test_runner.run(test_case)
         assert result.passed, f"Test failed: {result.error}"
 
-    @pytest.mark.xfail(reason="MemRef and InsertSync BUG")
     def test_for_if_else_nested(self, test_runner):
         """Test if-else nested inside a for loop."""
         test_case = TestForIfElseNested()
@@ -735,24 +731,28 @@ class TestCtrlFlowOperations:
         result = test_runner.run(test_case)
         assert result.passed, f"Test failed: {result.error}"
 
+    @pytest.mark.skip(reason="PTOAS BUG")
     def test_while_loop_add_pto(self, test_runner):
         """Test while loop add with PTO backend (scf.while codegen)."""
         test_case = TestWhileLoopAdd()
         result = test_runner.run(test_case)
         assert result.passed, f"Test failed (PTO): {result.error}"
 
+    @pytest.mark.skip(reason="PTOAS BUG")
     def test_for_loop_break_pto(self, test_runner):
         """Test for loop with break using PTO backend."""
         test_case = TestForLoopBreak()
         result = test_runner.run(test_case)
         assert result.passed, f"Test failed (PTO): {result.error}"
 
+    @pytest.mark.skip(reason="PTOAS BUG")
     def test_for_loop_continue_pto(self, test_runner):
         """Test for loop with continue using PTO backend."""
         test_case = TestForLoopContinue()
         result = test_runner.run(test_case)
         assert result.passed, f"Test failed (PTO): {result.error}"
 
+    @pytest.mark.skip(reason="PTOAS BUG")
     def test_for_loop_break_continue_pto(self, test_runner):
         """Test for loop with break and continue using PTO backend."""
         test_case = TestForLoopBreakContinue()

@@ -62,7 +62,7 @@ class TestPassPipelineNoEnforcement:
     def test_run_succeeds_without_required_properties(self):
         """Test that Run succeeds even when required properties are not tracked."""
         pipeline = passes.PassPipeline()
-        pipeline.add_pass(passes.basic_memory_reuse())
+        pipeline.add_pass(passes.memory_reuse())
         program = _make_simple_program()
         result = pipeline.run(program)
         assert result is not None
@@ -277,10 +277,11 @@ class TestVerifiedProperties:
         yield
 
     def test_verified_properties_contains_expected(self):
-        """Verified properties include SSAForm, TypeChecked, AllocatedMemoryAddr."""
+        """Verified properties include SSAForm, TypeChecked, MixedKernelExpanded, AllocatedMemoryAddr."""
         props = passes.get_verified_properties()
         assert props.contains(passes.IRProperty.SSAForm)
         assert props.contains(passes.IRProperty.TypeChecked)
+        assert props.contains(passes.IRProperty.MixedKernelExpanded)
         assert props.contains(passes.IRProperty.AllocatedMemoryAddr)
 
     def test_allocated_memory_addr_exists_in_enum(self):

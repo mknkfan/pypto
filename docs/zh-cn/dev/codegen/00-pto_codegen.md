@@ -9,7 +9,7 @@ PTO 代码生成 (CodeGen) (`PTOCodegen`) 从 PyPTO 中间表示 (IR) 生成 PTO
 - **自动 MLIR 生成**: 将 PyPTO IR 转换为 PTO-ISA MLIR 方言
 - **结构化代码生成 (CodeGen)**: 按顺序输出常量、张量 (Tensor) 视图和分配
 - **隐式降级**: 从 `tile.load`/`tile.store` 自动生成 `pto.partition_view`
-- **基于内存引用 (MemRef) 的分配**: 将 IR MemRef 对象映射到 `pto.alloc_tile` 操作
+- **基于 Tile 变量的分配**: 为每个 Tile 变量生成带显式 `addr` 的 `pto.alloc_tile` 操作
 - **类型 (Type) 感知转换**: 从 TileType 元数据推导 tile_buf/tensor_view 类型
 - **PTOAS 类型标注**: 为所有操作生成带类型的 `ins`/`outs` 子句
 
@@ -19,7 +19,7 @@ PTO 代码生成 (CodeGen) (`PTOCodegen`) 从 PyPTO 中间表示 (IR) 生成 PTO
 
 1. **常量**: 索引和浮点值的 `arith.constant`
 2. **张量视图**: 所有张量参数的 `pto.make_tensor_view`
-3. **分配**: 所有 Tile 缓冲区的 `pto.alloc_tile` (基于 MemRef)
+3. **分配**: 所有 Tile 变量的 `pto.alloc_tile` (按变量维度, 带 `addr` 属性)
 4. **操作**: 包含加载、计算、存储操作的函数体
 
 ## 架构
@@ -88,11 +88,16 @@ class MyKernel:
         tile_c = pl.add(tile_a, tile_b)
         pl.store(tile_c, [0, 0], a)
 
-# Compile with PTO backend and PTOAS optimization
-output_dir = compile(MyKernel, strategy=OptimizationStrategy.PTOAS, backend_type=BackendType.Ascend910B_PTO)
+# Compile with PTO backend and DebugTileOptimization (debug only)
+output_dir = compile(
+    MyKernel,
+    strategy=OptimizationStrategy.DebugTileOptimization,
+    backend_type=BackendType.Ascend910B_PTO,
+)
 ```
 
 `compile()` 函数会自动应用选定的优化策略, 并根据 `backend_type` 调用相应的代码生成器。
+正常的 PTO 编译应使用 `Default`；`DebugTileOptimization` 只用于调试 pass 流水线。
 
 ### 直接访问代码生成器
 
@@ -121,22 +126,24 @@ print(pto_code)
 
 | PyPTO 操作 | 生成的 PTO-ISA | 描述 |
 | ---------- | -------------- | ---- |
-| `tile.tpush_to_aiv(tile, aiv_idx=N)` | `pto.tpush_to_aiv ins(%tile : type) {aiv_idx = N}` | Cube → Vector 推送 |
-| `tile.tpush_to_aic(tile, aiv_idx=N)` | `pto.tpush_to_aic ins(%tile : type) {aiv_idx = N}` | Vector → Cube 推送 |
-| `tile.tpop_from_aic(aiv_idx=N)` | `pto.tpop_from_aic outs(%buf : type) {aiv_idx = N}` | 从 Cube 管道弹出 |
-| `tile.tpop_from_aiv(aiv_idx=N)` | `pto.tpop_from_aiv outs(%buf : type) {aiv_idx = N}` | 从 Vector 管道弹出 |
+| `tile.tpush_to_aiv(tile, split=N)` | `pto.tpush_to_aiv ins(%tile : type) {split = N}` | Cube → Vector 推送 |
+| `tile.tpush_to_aic(tile, split=N)` | `pto.tpush_to_aic ins(%tile : type) {split = N}` | Vector → Cube 推送 |
+| `tile.tpop_from_aic(split=N)` | `pto.tpop_from_aic outs(%buf : type) {split = N}` | 从 Cube 管道弹出 |
+| `tile.tpop_from_aiv(split=N)` | `pto.tpop_from_aiv outs(%buf : type) {split = N}` | 从 Vector 管道弹出 |
 | `system.tfree_to_aic(aiv_idx=N)` | `pto.tfree_to_aic {aiv_idx = N}` | 释放槽位给 Cube |
 | `system.tfree_to_aiv(aiv_idx=N)` | `pto.tfree_to_aiv {aiv_idx = N}` | 释放槽位给 Vector |
-| `system.aic_initialize_pipe(...)` | `pto.aic_initialize_pipe {dir_mask = D, slot_size = S, ...}` | Cube 管道初始化 |
-| `system.aiv_initialize_pipe(...)` | `pto.aiv_initialize_pipe {dir_mask = D, slot_size = S, ...}` | Vector 管道初始化 |
-| `system.reserve_buffer(...)` | `pto.reserve_buffer {name = "N", size = S, base = B}` | 预留缓冲区 |
-| `system.import_peer_buffer(...)` | `pto.import_peer_buffer {name = "N", peer_func = "F"}` | 导入对等缓冲区 |
+| `system.aic_initialize_pipe(...)` | `pto.aic_initialize_pipe {dir_mask = D, slot_size = S} (c2v_consumer_buf = %ssa : i32, v2c_consumer_buf = %ssa : i32)` | Cube 管道初始化 |
+| `system.aiv_initialize_pipe(...)` | `pto.aiv_initialize_pipe {dir_mask = D, slot_size = S} (c2v_consumer_buf = %ssa : i32, v2c_consumer_buf = %ssa : i32)` | Vector 管道初始化 |
+| `system.reserve_buffer(...)` | `%name = pto.reserve_buffer {name = "N", size = S, location = #pto.address_space<loc>, auto = A} -> i32` | 预留缓冲区 |
+| `system.import_peer_buffer(...)` | `%name = pto.import_reserved_buffer {name = "N", peer_func = @F} -> i32` | 导入对等缓冲区 |
 
 **说明：**
 
 - Push 操作使用带类型的 `ins()` 子句；Pop 操作使用 `outs()` 子句
-- `initialize_pipe` 仅在值 ≥ 0（即非 AUTO）时输出 `c2v_consumer_buf`/`v2c_consumer_buf`
-- `reserve_buffer` 在 base 为 AUTO (-1) 时输出 `base = auto`，显式地址时输出 `base = <value>`
+- `reserve_buffer` 和 `import_reserved_buffer` 返回 `i32` SSA 值；`initialize_pipe` 以操作数引用这些值
+- `reserve_buffer` 在 base 为 AUTO 时输出 `auto = true`，显式地址时输出 `auto = false, base = <value>`
+- `reserve_buffer` location 对于 AIC 函数为 `mat`，对于 AIV/InCore 函数为 `vec`
+- `import_reserved_buffer` 使用 MLIR 符号语法（`@func_name`）表示 `peer_func`
 - 缓冲区名称和 peer_func 字符串由 `CheckSafeIdentifier` 验证（仅允许字母数字和下划线）
 
 ### 参数类型处理
@@ -172,16 +179,21 @@ print(pto_code)
 基于附加到 TileType 变量的 MemRef 对象。代码生成器从关联的 TileType 推导 Tile 维度和数据类型:
 
 ```mlir
-%0 = pto.alloc_tile : !pto.tile_buf<loc=vec, dtype=f32, rows=32, cols=32,
-                       v_row=32, v_col=32, blayout=row_major,
+%mi_tile = pto.alloc_tile addr = %c8320 : !pto.tile_buf<loc=vec, dtype=f32, rows=16, cols=1,
+                       v_row=16, v_col=1, blayout=col_major,
+                       slayout=none_box, fractal=512, pad=0>
+%mi_tile_nd = pto.alloc_tile addr = %c8320 : !pto.tile_buf<loc=vec, dtype=f32, rows=1, cols=16,
+                       v_row=1, v_col=16, blayout=row_major,
                        slayout=none_box, fractal=512, pad=0>
 ```
 
-**MemRef 到 alloc_tile 的映射**:
+**Tile 变量到 alloc_tile 的映射**:
 
 - 内存空间 (`TileType.memory_space_`) 映射到 `loc` 属性 (使用 PTO 地址空间名)
-- Tile 数据类型和维度从关联的 TileType 元数据推导
-- 每个唯一 MemRef 对应一次分配
+- Tile 数据类型和维度从每个变量自身的 TileType 元数据推导
+- 每个 Tile 变量对应一次分配 (不是每个唯一 MemRef)
+- `addr` 属性来自 `MemRef.addr_`，输出为 `arith.constant ... : i64`
+- 共享同一 MemRef 的变量共享相同的 `addr` SSA 值
 
 ### 加载操作转换
 
@@ -469,7 +481,7 @@ output_dir/
 
 ### 实现
 
-**模块**: `python/pypto/ir/pto_codegen.py`
+**模块**: `python/pypto/backend/pto_backend.py`
 
 关键函数:
 

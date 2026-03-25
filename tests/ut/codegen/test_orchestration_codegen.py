@@ -1357,6 +1357,120 @@ class TestOrchestration:
         assert "ext_output_tensor)" in code
         assert "ext_output_tensor_iter" not in code
 
+    def test_tensor_assemble_uses_precomputed_view(self):
+        """tensor.assemble should lower to a pre-generated target view, not a host copy."""
+
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B_CCE)
+
+        @pl.program
+        class AssembleViewProgram:
+            @pl.function(type=pl.FunctionType.InCore)
+            def fill_row(
+                self,
+                x: pl.Tensor[[4, 8], pl.FP32],
+                r: pl.Scalar[pl.INDEX],
+                out: pl.Out[pl.Tensor[[1, 8], pl.FP32]],
+            ) -> pl.Tensor[[1, 8], pl.FP32]:
+                row_tile: pl.Tile[[1, 8], pl.FP32] = pl.load(x, [r, 0], [1, 8])
+                out_1: pl.Tensor[[1, 8], pl.FP32] = pl.store(row_tile, [0, 0], out)
+                return out_1
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def orch_assemble_view(
+                self,
+                x: pl.Tensor[[4, 8], pl.FP32],
+                out: pl.Out[pl.Tensor[[4, 8], pl.FP32]],
+            ) -> pl.Tensor[[4, 8], pl.FP32]:
+                for r in pl.range(4):
+                    row: pl.Tensor[[1, 8], pl.FP32] = pl.create_tensor([1, 8], dtype=pl.FP32)
+                    row = self.fill_row(x, r, row)
+                    out = pl.assemble(out, row, [r, 0])
+                return out
+
+        pm = PassManager.get_strategy(OptimizationStrategy.Default)
+        transformed = pm.run_passes(AssembleViewProgram)
+
+        generator = codegen.CCECodegen()
+        files = generator.generate(transformed)
+        code = files["orchestration/orch_assemble_view.cpp"]
+
+        assert "Tensor row = ext_out.view(row_shapes, row_offsets);" in code
+        assert "make_output_param(row)" in code
+        assert "Tensor row = make_tensor(" not in code
+        assert "memcpy(" not in code
+        assert "ext_out = out;" not in code
+
+    def test_tensor_assemble_duplicate_source_root_skips_view_rewrite(self):
+        """A source buffer assembled more than once must keep its standalone allocation."""
+
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B_CCE)
+
+        @pl.program
+        class DuplicateAssembleProgram:
+            @pl.function(type=pl.FunctionType.InCore)
+            def fill_row(
+                self,
+                x: pl.Tensor[[4, 8], pl.FP32],
+                r: pl.Scalar[pl.INDEX],
+                out: pl.Out[pl.Tensor[[1, 8], pl.FP32]],
+            ) -> pl.Tensor[[1, 8], pl.FP32]:
+                row_tile: pl.Tile[[1, 8], pl.FP32] = pl.load(x, [r, 0], [1, 8])
+                out_1: pl.Tensor[[1, 8], pl.FP32] = pl.store(row_tile, [0, 0], out)
+                return out_1
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def orch_duplicate_assemble(
+                self,
+                x: pl.Tensor[[4, 8], pl.FP32],
+                out: pl.Out[pl.Tensor[[4, 8], pl.FP32]],
+            ) -> pl.Tensor[[4, 8], pl.FP32]:
+                zero: pl.Scalar[pl.INDEX] = 0
+                row: pl.Tensor[[1, 8], pl.FP32] = pl.create_tensor([1, 8], dtype=pl.FP32)
+                row = self.fill_row(x, zero, row)
+                out = pl.assemble(out, row, [0, 0])
+                out = pl.assemble(out, row, [1, 0])
+                return out
+
+        pm = PassManager.get_strategy(OptimizationStrategy.Default)
+        transformed = pm.run_passes(DuplicateAssembleProgram)
+
+        generator = codegen.CCECodegen()
+        files = generator.generate(transformed)
+        code = files["orchestration/orch_duplicate_assemble.cpp"]
+
+        assert "Tensor row = make_tensor(row_shapes, 2, DataType::FLOAT32);" in code
+        assert "Tensor row = ext_out.view(row_shapes, row_offsets);" not in code
+
+    def test_tensor_assemble_slice_source_does_not_require_view_fast_path(self):
+        """tensor.assemble should stay codegenable when the source is not a rewritten tensor.create."""
+
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B_CCE)
+
+        @pl.program
+        class SliceAssembleProgram:
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def orch_slice_source(
+                self,
+                x: pl.Tensor[[4, 8], pl.FP32],
+                out: pl.Out[pl.Tensor[[4, 8], pl.FP32]],
+            ) -> pl.Tensor[[4, 8], pl.FP32]:
+                chunk: pl.Tensor[[1, 8], pl.FP32] = pl.slice(x, [1, 8], [0, 0])
+                out = pl.assemble(out, chunk, [0, 0])
+                return out
+
+        pm = PassManager.get_strategy(OptimizationStrategy.Default)
+        transformed = pm.run_passes(SliceAssembleProgram)
+
+        generator = codegen.CCECodegen()
+        files = generator.generate(transformed)
+        code = files["orchestration/orch_slice_source.cpp"]
+
+        assert "Tensor chunk = ext_x.view(chunk_shapes, chunk_offsets);" in code
+        assert "Tensor chunk = ext_out.view(chunk_shapes, chunk_offsets);" not in code
+
     def test_param_with_numeric_suffix(self):
         """Regression test for issue #573: params with numeric suffixes must not be collapsed.
 
@@ -1417,6 +1531,48 @@ class TestOrchestration:
 
         # Tuple-return elements must not be collapsed into a single alias
         assert "Tensor& out =" not in code
+
+    def test_repeated_auto_output_buffers_get_unique_names(self):
+        """Repeated auto-generated output buffers should keep distinct emitted names."""
+
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B_CCE)
+
+        @pl.program
+        class RepeatedAutoOutputProgram:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel_add(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                y: pl.Tensor[[64], pl.FP32],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                z: pl.Tensor[[64], pl.FP32] = pl.add(x, y)
+                return z
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def orch_repeat(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                y: pl.Tensor[[64], pl.FP32],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                first: pl.Tensor[[64], pl.FP32] = self.kernel_add(x, y)
+                second: pl.Tensor[[64], pl.FP32] = self.kernel_add(first, y)
+                return second
+
+        pm = PassManager.get_strategy(OptimizationStrategy.Default)
+        transformed = pm.run_passes(RepeatedAutoOutputProgram)
+
+        generator = codegen.CCECodegen()
+        files = generator.generate(transformed)
+        code = files["orchestration/orch_repeat.cpp"]
+
+        assert code.count("Tensor ret0__out = make_tensor(") == 1
+        assert code.count("Tensor ret0__out_1 = make_tensor(") == 1
+        assert "make_output_param(ret0__out)" in code
+        assert "make_output_param(ret0__out_1)" in code
+        assert "Tensor& first = ret0__out;" in code
+        assert "Tensor& second = ret0__out_1;" in code
+        assert "make_output_param(ret0)," not in code
 
 
 class TestTensorReadWriteOffsetCodegen:
@@ -1520,6 +1676,84 @@ class TestTensorReadWriteOffsetCodegen:
         # Write generates flat offset 11 or the expression 1*8+3
         assert ("arg_t_ptr)[11]" in code) or ("1 * 8 + 3" in code)
         assert "arg_t_ptr)" in code
+
+    def test_infer_output_param_from_loop_carried_store(self):
+        """Loop-carried store to a default-In tensor should emit output params."""
+
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B_CCE)
+
+        @pl.program
+        class OutputProgram:
+            @pl.function(type=pl.FunctionType.InCore)
+            def fill(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out: pl.Tensor[[64], pl.FP32],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                for i, (out_iter,) in pl.range(0, 64, 16, init_values=(out,)):
+                    x_tile: pl.Tile[[16], pl.FP32] = pl.load(x, [i], [16])
+                    out_next: pl.Tensor[[64], pl.FP32] = pl.store(x_tile, [i], out_iter)
+                    result = pl.yield_(out_next)
+                return result
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def orch(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out: pl.Tensor[[64], pl.FP32],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                out = self.fill(x, out)
+                return out
+
+        generator = codegen.CCECodegen()
+        pm = PassManager.get_strategy(OptimizationStrategy.Default)
+        transformed = pm.run_passes(OutputProgram)
+        files = generator.generate(transformed)
+        code = files["orchestration/orch.cpp"]
+
+        assert "make_input_param(ext_x)" in code
+        assert "make_output_param(ext_out)" in code
+
+    def test_infer_inout_param_from_loop_carried_read_modify_write(self):
+        """Loop-carried read-modify-write should emit inout params."""
+
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B_CCE)
+
+        @pl.program
+        class InOutProgram:
+            @pl.function(type=pl.FunctionType.InCore)
+            def accumulate(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                acc: pl.Tensor[[64], pl.FP32],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                for i, (acc_iter,) in pl.range(0, 64, 16, init_values=(acc,)):
+                    x_tile: pl.Tile[[16], pl.FP32] = pl.load(x, [i], [16])
+                    acc_tile: pl.Tile[[16], pl.FP32] = pl.load(acc_iter, [i], [16])
+                    sum_tile: pl.Tile[[16], pl.FP32] = pl.add(x_tile, acc_tile)
+                    acc_next: pl.Tensor[[64], pl.FP32] = pl.store(sum_tile, [i], acc_iter)
+                    result = pl.yield_(acc_next)
+                return result
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def orch(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                acc: pl.Tensor[[64], pl.FP32],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                acc = self.accumulate(x, acc)
+                return acc
+
+        generator = codegen.CCECodegen()
+        pm = PassManager.get_strategy(OptimizationStrategy.Default)
+        transformed = pm.run_passes(InOutProgram)
+        files = generator.generate(transformed)
+        code = files["orchestration/orch.cpp"]
+
+        assert "make_input_param(ext_x)" in code
+        assert "make_inout_param(ext_acc)" in code
 
 
 if __name__ == "__main__":

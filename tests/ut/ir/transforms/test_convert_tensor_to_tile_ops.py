@@ -604,18 +604,18 @@ class TestConvertTensorToTileOps:
             def main_incore_0(
                 self,
                 lhs: pl.Tensor[[16, 128], pl.BF16],
-                rhs: pl.Tensor[[128, 128], pl.BF16],
-            ) -> pl.Tensor[[16, 128], pl.BF16]:
-                y: pl.Tensor[[16, 128], pl.BF16] = pl.matmul(lhs, rhs, b_trans=True)
+                rhs: pl.Tensor[[64, 128], pl.BF16],
+            ) -> pl.Tensor[[16, 64], pl.BF16]:
+                y: pl.Tensor[[16, 64], pl.BF16] = pl.matmul(lhs, rhs, b_trans=True)
                 return y
 
             @pl.function
             def main(
                 self,
                 lhs: pl.Tensor[[16, 128], pl.BF16],
-                rhs: pl.Tensor[[128, 128], pl.BF16],
-            ) -> pl.Tensor[[16, 128], pl.BF16]:
-                y: pl.Tensor[[16, 128], pl.BF16] = self.main_incore_0(lhs, rhs)
+                rhs: pl.Tensor[[64, 128], pl.BF16],
+            ) -> pl.Tensor[[16, 64], pl.BF16]:
+                y: pl.Tensor[[16, 64], pl.BF16] = self.main_incore_0(lhs, rhs)
                 return y
 
         @pl.program
@@ -624,27 +624,27 @@ class TestConvertTensorToTileOps:
             def main_incore_0(
                 self,
                 lhs: pl.Tensor[[16, 128], pl.BF16],
-                rhs: pl.Tensor[[128, 128], pl.BF16],
-                out_0: pl.Out[pl.Tensor[[16, 128], pl.BF16]],
-            ) -> pl.Tensor[[16, 128], pl.BF16]:
+                rhs: pl.Tensor[[64, 128], pl.BF16],
+                out_0: pl.Out[pl.Tensor[[16, 64], pl.BF16]],
+            ) -> pl.Tensor[[16, 64], pl.BF16]:
                 lhs_mat: pl.Tile[[16, 128], pl.BF16] = pl.load(
                     lhs, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat
                 )
-                rhs_mat: pl.Tile[[128, 128], pl.BF16] = pl.load(
-                    rhs, [0, 0], [128, 128], [128, 128], target_memory=pl.MemorySpace.Mat, transpose=True
+                rhs_mat: pl.Tile[[128, 64], pl.BF16] = pl.load(
+                    rhs, [0, 0], [128, 64], [128, 64], target_memory=pl.MemorySpace.Mat, transpose=True
                 )
-                y_tile: pl.Tile[[16, 128], pl.FP32] = pl.matmul(lhs_mat, rhs_mat)
-                out_0_store: pl.Tensor[[16, 128], pl.BF16] = pl.store(y_tile, [0, 0], out_0)
+                y_tile: pl.Tile[[16, 64], pl.FP32] = pl.matmul(lhs_mat, rhs_mat)
+                out_0_store: pl.Tensor[[16, 64], pl.BF16] = pl.store(y_tile, [0, 0], out_0)
                 return out_0_store
 
             @pl.function
             def main(
                 self,
                 lhs: pl.Tensor[[16, 128], pl.BF16],
-                rhs: pl.Tensor[[128, 128], pl.BF16],
-            ) -> pl.Tensor[[16, 128], pl.BF16]:
-                out_0: pl.Tensor[[16, 128], pl.BF16] = pl.create_tensor([16, 128], dtype=pl.BF16)
-                y: pl.Tensor[[16, 128], pl.BF16] = self.main_incore_0(lhs, rhs, out_0)
+                rhs: pl.Tensor[[64, 128], pl.BF16],
+            ) -> pl.Tensor[[16, 64], pl.BF16]:
+                out_0: pl.Tensor[[16, 64], pl.BF16] = pl.create_tensor([16, 64], dtype=pl.BF16)
+                y: pl.Tensor[[16, 64], pl.BF16] = self.main_incore_0(lhs, rhs, out_0)
                 return y
 
         After = passes.convert_tensor_to_tile_ops()(Before)
@@ -1307,6 +1307,188 @@ class TestNestedControlFlow:
         After = passes.convert_tensor_to_tile_ops()(Before)
         ir.assert_structural_equal(After, Expected)
 
+    def test_infer_out_direction_for_loop_carried_store(self):
+        """Loop-carried tensor written by store upgrades default In to Out."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out: pl.Tensor[[64], pl.FP32],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                for i, (out_iter,) in pl.range(0, 64, 16, init_values=(out,)):
+                    x_tile: pl.Tile[[16], pl.FP32] = pl.load(x, [i], [16])
+                    out_next: pl.Tensor[[64], pl.FP32] = pl.store(x_tile, [i], out_iter)
+                    result = pl.yield_(out_next)
+                return result
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                for i, (out_iter,) in pl.range(0, 64, 16, init_values=(out,)):
+                    x_tile: pl.Tile[[16], pl.FP32] = pl.load(x, [i], [16])
+                    out_next: pl.Tensor[[64], pl.FP32] = pl.store(x_tile, [i], out_iter)
+                    result = pl.yield_(out_next)
+                return result
+
+        After = passes.convert_tensor_to_tile_ops()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_infer_inout_direction_for_loop_carried_read_modify_write(self):
+        """Loop-carried tensor read before store upgrades default In to InOut."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                acc: pl.Tensor[[64], pl.FP32],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                for i, (acc_iter,) in pl.range(0, 64, 16, init_values=(acc,)):
+                    x_tile: pl.Tile[[16], pl.FP32] = pl.load(x, [i], [16])
+                    acc_tile: pl.Tile[[16], pl.FP32] = pl.load(acc_iter, [i], [16])
+                    sum_tile: pl.Tile[[16], pl.FP32] = pl.add(x_tile, acc_tile)
+                    acc_next: pl.Tensor[[64], pl.FP32] = pl.store(sum_tile, [i], acc_iter)
+                    result = pl.yield_(acc_next)
+                return result
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                acc: pl.InOut[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                for i, (acc_iter,) in pl.range(0, 64, 16, init_values=(acc,)):
+                    x_tile: pl.Tile[[16], pl.FP32] = pl.load(x, [i], [16])
+                    acc_tile: pl.Tile[[16], pl.FP32] = pl.load(acc_iter, [i], [16])
+                    sum_tile: pl.Tile[[16], pl.FP32] = pl.add(x_tile, acc_tile)
+                    acc_next: pl.Tensor[[64], pl.FP32] = pl.store(sum_tile, [i], acc_iter)
+                    result = pl.yield_(acc_next)
+                return result
+
+        After = passes.convert_tensor_to_tile_ops()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_infer_out_direction_for_kwarg_tile_store(self):
+        """tile.store with output_tensor kwarg marks the destination tensor as Out."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out: pl.Tensor[[64], pl.FP32],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                x_tile: pl.Tile[[64], pl.FP32] = pl.tile.load(x, offsets=[0], shapes=[64])
+                out_next: pl.Tensor[[64], pl.FP32] = pl.tile.store(x_tile, offsets=[0], output_tensor=out)
+                return out_next
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                x_tile: pl.Tile[[64], pl.FP32] = pl.tile.load(x, offsets=[0], shapes=[64])
+                out_next: pl.Tensor[[64], pl.FP32] = pl.tile.store(x_tile, offsets=[0], output_tensor=out)
+                return out_next
+
+        After = passes.convert_tensor_to_tile_ops()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_infer_out_direction_for_scope_alias(self):
+        """Aliases introduced inside ScopeStmt remain visible after the scope."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out: pl.Tensor[[64], pl.FP32],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                x_tile: pl.Tile[[64], pl.FP32] = pl.tile.load(x, offsets=[0], shapes=[64])
+                with pl.incore():
+                    out_alias: pl.Tensor[[64], pl.FP32] = out
+                    pl.tensor.read(x, [0])
+                out_next: pl.Tensor[[64], pl.FP32] = pl.store(x_tile, [0], out_alias)
+                return out_next
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                x_tile: pl.Tile[[64], pl.FP32] = pl.tile.load(x, offsets=[0], shapes=[64])
+                with pl.incore():
+                    out_alias: pl.Tensor[[64], pl.FP32] = out
+                    pl.tensor.read(x, [0])
+                out_next: pl.Tensor[[64], pl.FP32] = pl.store(x_tile, [0], out_alias)
+                return out_next
+
+        After = passes.convert_tensor_to_tile_ops()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_infer_out_direction_for_if_return_alias(self):
+        """Aliases yielded from IfStmt branches propagate to later stores."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                cond: pl.Scalar[pl.INT64],
+                x: pl.Tensor[[64], pl.FP32],
+                out: pl.Tensor[[64], pl.FP32],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                x_tile: pl.Tile[[64], pl.FP32] = pl.tile.load(x, offsets=[0], shapes=[64])
+                if cond == 0:
+                    branch_out: pl.Tensor[[64], pl.FP32] = out
+                    selected = pl.yield_(branch_out)
+                else:
+                    branch_out: pl.Tensor[[64], pl.FP32] = out
+                    selected = pl.yield_(branch_out)
+                out_next: pl.Tensor[[64], pl.FP32] = pl.store(x_tile, [0], selected)
+                return out_next
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                cond: pl.Scalar[pl.INT64],
+                x: pl.Tensor[[64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                x_tile: pl.Tile[[64], pl.FP32] = pl.tile.load(x, offsets=[0], shapes=[64])
+                if cond == 0:
+                    branch_out: pl.Tensor[[64], pl.FP32] = out
+                    selected = pl.yield_(branch_out)
+                else:
+                    branch_out: pl.Tensor[[64], pl.FP32] = out
+                    selected = pl.yield_(branch_out)
+                out_next: pl.Tensor[[64], pl.FP32] = pl.store(x_tile, [0], selected)
+                return out_next
+
+        After = passes.convert_tensor_to_tile_ops()(Before)
+        ir.assert_structural_equal(After, Expected)
+
     def test_missing_conversion_raises_error(self):
         """TensorOp with no registered converter raises an error when encountered in InCore body."""
         span = ir.Span.unknown()
@@ -1728,7 +1910,7 @@ class TestGmLocalTensorConversion:
             @pl.function(type=pl.FunctionType.InCore)
             def main_incore_0(
                 self,
-                dst: pl.Tensor[[4], pl.FP32],
+                dst: pl.Out[pl.Tensor[[4], pl.FP32]],
                 val: pl.Scalar[pl.FP32],
             ) -> pl.Scalar[pl.FP32]:
                 pl.tensor.write(dst, [0], val)

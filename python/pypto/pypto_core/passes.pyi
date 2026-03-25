@@ -203,11 +203,14 @@ class PassPipeline:
 def init_mem_ref() -> Pass:
     """Create an init memref pass."""
 
-def basic_memory_reuse() -> Pass:
-    """Create a basic memory reuse pass."""
+def memory_reuse() -> Pass:
+    """Create a memory reuse pass."""
 
 def insert_sync() -> Pass:
     """Create an insert sync pass."""
+
+def legalize_pto_buffer_reuse() -> Pass:
+    """Create a PTO buffer reuse legalisation pass."""
 
 def allocate_memory_addr() -> Pass:
     """Create an allocate memory address pass."""
@@ -348,7 +351,8 @@ __all__ = [
     "PassContext",
     "PassPipeline",
     "init_mem_ref",
-    "basic_memory_reuse",
+    "memory_reuse",
+    "legalize_pto_buffer_reuse",
     "insert_sync",
     "allocate_memory_addr",
     "VerificationError",

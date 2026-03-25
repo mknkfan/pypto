@@ -9,6 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
+#include <algorithm>
 #include <any>
 #include <cstddef>
 #include <memory>
@@ -22,7 +23,6 @@
 #include "pypto/core/dtype.h"
 #include "pypto/core/error.h"
 #include "pypto/core/logging.h"
-#include "pypto/ir/core.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
 #include "pypto/ir/kind_traits.h"
@@ -36,32 +36,17 @@
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
 #include "pypto/ir/transforms/utils/auto_name_utils.h"
+#include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/type.h"
 #include "pypto/ir/verifier/verifier.h"
 
 namespace pypto {
 namespace ir {
 
+using transform_utils::FlattenToStmts;
+using transform_utils::SubstituteExpr;
+
 namespace {
-
-/**
- * @brief Unwrap a single StmtPtr into a flat vector of statements.
- *
- * If the statement is a SeqStmts, returns its children; otherwise returns a single-element vector.
- */
-std::vector<StmtPtr> FlattenToStmts(const StmtPtr& stmt) {
-  if (auto seq = As<SeqStmts>(stmt)) {
-    return seq->stmts_;
-  }
-  return {stmt};
-}
-
-/**
- * @brief Wrap a vector of statements into a single SeqStmts node.
- */
-StmtPtr WrapInSeqStmts(const std::vector<StmtPtr>& stmts, const Span& span) {
-  return std::make_shared<SeqStmts>(stmts, span);
-}
 
 std::string MakeTileValueName(const std::string& source_name) {
   return auto_name::BuildName(auto_name::GetBaseName(source_name), "", "tile");
@@ -160,143 +145,6 @@ ExprPtr MakeZeroOffsets(size_t ndim, const Span& span) {
  */
 ExprPtr MakeShapeTuple(const std::vector<ExprPtr>& shape, const Span& span) {
   return std::make_shared<MakeTuple>(shape, span);
-}
-
-/**
- * @brief Reconstruct a BinaryExpr with new operands, dispatching on ObjectKind.
- */
-ExprPtr ReconstructBinaryExpr(ObjectKind kind, const ExprPtr& left, const ExprPtr& right, DataType dtype,
-                              const Span& span) {
-  // clang-format off
-  switch (kind) {
-    case ObjectKind::Add:           return std::make_shared<Add>(left, right, dtype, span);
-    case ObjectKind::Sub:           return std::make_shared<Sub>(left, right, dtype, span);
-    case ObjectKind::Mul:           return std::make_shared<Mul>(left, right, dtype, span);
-    case ObjectKind::FloorDiv:      return std::make_shared<FloorDiv>(left, right, dtype, span);
-    case ObjectKind::FloorMod:      return std::make_shared<FloorMod>(left, right, dtype, span);
-    case ObjectKind::FloatDiv:      return std::make_shared<FloatDiv>(left, right, dtype, span);
-    case ObjectKind::Min:           return std::make_shared<Min>(left, right, dtype, span);
-    case ObjectKind::Max:           return std::make_shared<Max>(left, right, dtype, span);
-    case ObjectKind::Pow:           return std::make_shared<Pow>(left, right, dtype, span);
-    case ObjectKind::Eq:            return std::make_shared<Eq>(left, right, dtype, span);
-    case ObjectKind::Ne:            return std::make_shared<Ne>(left, right, dtype, span);
-    case ObjectKind::Lt:            return std::make_shared<Lt>(left, right, dtype, span);
-    case ObjectKind::Le:            return std::make_shared<Le>(left, right, dtype, span);
-    case ObjectKind::Gt:            return std::make_shared<Gt>(left, right, dtype, span);
-    case ObjectKind::Ge:            return std::make_shared<Ge>(left, right, dtype, span);
-    case ObjectKind::And:           return std::make_shared<And>(left, right, dtype, span);
-    case ObjectKind::Or:            return std::make_shared<Or>(left, right, dtype, span);
-    case ObjectKind::Xor:           return std::make_shared<Xor>(left, right, dtype, span);
-    case ObjectKind::BitAnd:        return std::make_shared<BitAnd>(left, right, dtype, span);
-    case ObjectKind::BitOr:         return std::make_shared<BitOr>(left, right, dtype, span);
-    case ObjectKind::BitXor:        return std::make_shared<BitXor>(left, right, dtype, span);
-    case ObjectKind::BitShiftLeft:  return std::make_shared<BitShiftLeft>(left, right, dtype, span);
-    case ObjectKind::BitShiftRight: return std::make_shared<BitShiftRight>(left, right, dtype, span);
-    default:
-      throw pypto::InternalError("ReconstructBinaryExpr: unsupported ObjectKind");
-  }
-  // clang-format on
-}
-
-/**
- * @brief Reconstruct a UnaryExpr with a new operand, dispatching on ObjectKind.
- */
-ExprPtr ReconstructUnaryExpr(ObjectKind kind, const ExprPtr& operand, DataType dtype, const Span& span) {
-  switch (kind) {
-    case ObjectKind::Abs:
-      return std::make_shared<Abs>(operand, dtype, span);
-    case ObjectKind::Neg:
-      return std::make_shared<Neg>(operand, dtype, span);
-    case ObjectKind::Not:
-      return std::make_shared<Not>(operand, dtype, span);
-    case ObjectKind::BitNot:
-      return std::make_shared<BitNot>(operand, dtype, span);
-    case ObjectKind::Cast:
-      return std::make_shared<Cast>(operand, dtype, span);
-    default:
-      throw pypto::InternalError("ReconstructUnaryExpr: unsupported ObjectKind");
-  }
-}
-
-/**
- * @brief Substitute variables in an expression using a pointer-identity map.
- *
- * Recursively traverses Call, MakeTuple, BinaryExpr, UnaryExpr, and
- * TupleGetItemExpr to replace Var references.
- */
-ExprPtr SubstituteExpr(const ExprPtr& expr, const std::unordered_map<const Var*, VarPtr>& var_map) {
-  if (auto iter_arg = As<IterArg>(expr)) {
-    auto it = var_map.find(iter_arg.get());
-    if (it != var_map.end()) {
-      return it->second;
-    }
-    return expr;
-  }
-  if (auto var = As<Var>(expr)) {
-    auto it = var_map.find(var.get());
-    if (it != var_map.end()) {
-      return it->second;
-    }
-    return expr;
-  }
-  if (auto call = As<Call>(expr)) {
-    std::vector<ExprPtr> new_args;
-    new_args.reserve(call->args_.size());
-    bool changed = false;
-    for (const auto& arg : call->args_) {
-      auto new_arg = SubstituteExpr(arg, var_map);
-      new_args.push_back(new_arg);
-      if (new_arg != arg) {
-        changed = true;
-      }
-    }
-    if (!changed) {
-      return expr;
-    }
-    return std::make_shared<Call>(call->op_, new_args, call->kwargs_, call->GetType(), call->span_);
-  }
-  if (auto make_tuple = As<MakeTuple>(expr)) {
-    std::vector<ExprPtr> new_elements;
-    new_elements.reserve(make_tuple->elements_.size());
-    bool changed = false;
-    for (const auto& elem : make_tuple->elements_) {
-      auto new_elem = SubstituteExpr(elem, var_map);
-      new_elements.push_back(new_elem);
-      if (new_elem != elem) {
-        changed = true;
-      }
-    }
-    if (!changed) {
-      return expr;
-    }
-    return std::make_shared<MakeTuple>(new_elements, make_tuple->span_);
-  }
-  if (auto tgi = As<TupleGetItemExpr>(expr)) {
-    auto new_tuple = SubstituteExpr(tgi->tuple_, var_map);
-    if (new_tuple == tgi->tuple_) {
-      return expr;
-    }
-    return std::make_shared<TupleGetItemExpr>(new_tuple, tgi->index_, tgi->span_);
-  }
-  if (auto bin = As<BinaryExpr>(expr)) {
-    auto new_left = SubstituteExpr(bin->left_, var_map);
-    auto new_right = SubstituteExpr(bin->right_, var_map);
-    if (new_left == bin->left_ && new_right == bin->right_) {
-      return expr;
-    }
-    auto dtype = GetScalarDtype(expr);
-    return ReconstructBinaryExpr(bin->GetKind(), new_left, new_right, dtype, bin->span_);
-  }
-  if (auto un = As<UnaryExpr>(expr)) {
-    auto new_operand = SubstituteExpr(un->operand_, var_map);
-    if (new_operand == un->operand_) {
-      return expr;
-    }
-    auto dtype = GetScalarDtype(expr);
-    return ReconstructUnaryExpr(un->GetKind(), new_operand, dtype, un->span_);
-  }
-  // For leaf expression types (ConstInt, ConstFloat, etc.), return as-is
-  return expr;
 }
 
 /**
@@ -441,8 +289,8 @@ std::vector<StmtPtr> TransformIncoreBody(const std::vector<StmtPtr>& stmts,
     if (auto scope = As<ScopeStmt>(stmt)) {
       auto body_stmts = FlattenToStmts(scope->body_);
       auto inner = TransformIncoreBody(body_stmts, tensor_to_tile, conv_registry, op_registry, span);
-      result.push_back(std::make_shared<ScopeStmt>(scope->scope_kind_,
-                                                   WrapInSeqStmts(inner, scope->body_->span_), scope->span_));
+      result.push_back(std::make_shared<ScopeStmt>(
+          scope->scope_kind_, std::make_shared<SeqStmts>(inner, scope->body_->span_), scope->span_));
       continue;
     }
 
@@ -454,7 +302,7 @@ std::vector<StmtPtr> TransformIncoreBody(const std::vector<StmtPtr>& stmts,
       auto then_map = tensor_to_tile;
       auto then_stmts = FlattenToStmts(if_stmt->then_body_);
       auto new_then_stmts = TransformIncoreBody(then_stmts, then_map, conv_registry, op_registry, span);
-      auto new_then_body = WrapInSeqStmts(new_then_stmts, if_stmt->then_body_->span_);
+      auto new_then_body = std::make_shared<SeqStmts>(new_then_stmts, if_stmt->then_body_->span_);
 
       // Recurse into else branch with a copy of the map
       std::optional<StmtPtr> new_else_body;
@@ -462,7 +310,7 @@ std::vector<StmtPtr> TransformIncoreBody(const std::vector<StmtPtr>& stmts,
         auto else_map = tensor_to_tile;
         auto else_stmts = FlattenToStmts(*if_stmt->else_body_);
         auto new_else_stmts = TransformIncoreBody(else_stmts, else_map, conv_registry, op_registry, span);
-        new_else_body = WrapInSeqStmts(new_else_stmts, (*if_stmt->else_body_)->span_);
+        new_else_body = std::make_shared<SeqStmts>(new_else_stmts, (*if_stmt->else_body_)->span_);
       }
 
       // Update return_vars types based on yield types (check then branch, fall back to else)
@@ -515,7 +363,7 @@ std::vector<StmtPtr> TransformIncoreBody(const std::vector<StmtPtr>& stmts,
       // Recurse into body
       auto body_stmts = FlattenToStmts(for_stmt->body_);
       auto new_body_stmts = TransformIncoreBody(body_stmts, body_map, conv_registry, op_registry, span);
-      auto new_body = WrapInSeqStmts(new_body_stmts, for_stmt->body_->span_);
+      auto new_body = std::make_shared<SeqStmts>(new_body_stmts, for_stmt->body_->span_);
 
       // Update return_vars types to match iter_arg types
       std::vector<VarPtr> new_return_vars;
@@ -564,7 +412,7 @@ std::vector<StmtPtr> TransformIncoreBody(const std::vector<StmtPtr>& stmts,
       // Recurse into body
       auto body_stmts = FlattenToStmts(while_stmt->body_);
       auto new_body_stmts = TransformIncoreBody(body_stmts, body_map, conv_registry, op_registry, span);
-      auto new_body = WrapInSeqStmts(new_body_stmts, while_stmt->body_->span_);
+      auto new_body = std::make_shared<SeqStmts>(new_body_stmts, while_stmt->body_->span_);
 
       // Update return_vars types to match iter_arg types
       std::vector<VarPtr> new_return_vars;
@@ -868,6 +716,398 @@ bool StmtUsesVar(const StmtPtr& stmt, const Var* target) {
   return visitor.Found();
 }
 
+using ParamOrigins = std::vector<size_t>;
+using AliasOriginMap = std::unordered_map<const Var*, ParamOrigins>;
+
+struct YieldAliasInfo {
+  bool has_yield = false;
+  std::vector<ParamOrigins> origins;
+};
+
+void AddOrigin(ParamOrigins& origins, size_t index) {
+  if (std::find(origins.begin(), origins.end(), index) == origins.end()) {
+    origins.push_back(index);
+  }
+}
+
+void MergeOrigins(ParamOrigins& dst, const ParamOrigins& src) {
+  for (size_t index : src) {
+    AddOrigin(dst, index);
+  }
+}
+
+void MarkAccess(const ParamOrigins& origins, std::vector<bool>& flags) {
+  for (size_t index : origins) {
+    if (index < flags.size()) {
+      flags[index] = true;
+    }
+  }
+}
+
+ParamOrigins LookupOrigins(const Var* var, const AliasOriginMap& origin_map) {
+  if (!var) return {};
+  auto it = origin_map.find(var);
+  if (it == origin_map.end()) return {};
+  return it->second;
+}
+
+ParamOrigins CollectReferencedOrigins(const ExprPtr& expr, const AliasOriginMap& origin_map);
+
+ExprPtr GetCallKwargExpr(const CallPtr& call, const std::string& key) {
+  if (!call || !call->HasKwarg(key)) return nullptr;
+  return call->GetKwarg<ExprPtr>(key, ExprPtr{});
+}
+
+ExprPtr GetWriteTargetExpr(const CallPtr& call) {
+  if (!call) return nullptr;
+
+  const std::string& op_name = call->op_->name_;
+  if (op_name == "tensor.write" && !call->args_.empty()) {
+    return call->args_[0];
+  }
+  if (op_name == "tile.store") {
+    if (call->args_.size() >= 3) {
+      return call->args_[2];
+    }
+    return GetCallKwargExpr(call, "output_tensor");
+  }
+  if (op_name == "tensor.assemble" && !call->args_.empty()) {
+    return call->args_[0];
+  }
+  return nullptr;
+}
+
+void UpdateTensorAliasOrigin(const VarPtr& var, const ParamOrigins& origins, AliasOriginMap& origin_map) {
+  if (As<TensorType>(var->GetType()) && !origins.empty()) {
+    origin_map[var.get()] = origins;
+  } else {
+    origin_map.erase(var.get());
+  }
+}
+
+ParamOrigins GetAliasOrigins(const ExprPtr& expr, const AliasOriginMap& origin_map) {
+  if (!expr) return {};
+
+  if (auto var = AsVarLike(expr)) {
+    return LookupOrigins(var.get(), origin_map);
+  }
+
+  if (auto tuple_get = As<TupleGetItemExpr>(expr)) {
+    if (auto tuple = As<MakeTuple>(tuple_get->tuple_)) {
+      if (tuple_get->index_ >= 0 && static_cast<size_t>(tuple_get->index_) < tuple->elements_.size()) {
+        return GetAliasOrigins(tuple->elements_[static_cast<size_t>(tuple_get->index_)], origin_map);
+      }
+    }
+    return {};
+  }
+
+  auto call = As<Call>(expr);
+  if (!call) return {};
+
+  const std::string& op_name = call->op_->name_;
+  if (auto write_target = GetWriteTargetExpr(call)) {
+    return GetAliasOrigins(write_target, origin_map);
+  }
+  if (op_name == "tensor.slice" && !call->args_.empty()) {
+    return GetAliasOrigins(call->args_[0], origin_map);
+  }
+  return {};
+}
+
+ParamOrigins CollectReferencedOrigins(const ExprPtr& expr, const AliasOriginMap& origin_map) {
+  if (!expr) return {};
+
+  if (auto var = AsVarLike(expr)) {
+    return LookupOrigins(var.get(), origin_map);
+  }
+
+  if (auto tuple = As<MakeTuple>(expr)) {
+    ParamOrigins origins;
+    for (const auto& element : tuple->elements_) {
+      MergeOrigins(origins, CollectReferencedOrigins(element, origin_map));
+    }
+    return origins;
+  }
+
+  if (auto tuple_get = As<TupleGetItemExpr>(expr)) {
+    if (auto tuple = As<MakeTuple>(tuple_get->tuple_)) {
+      if (tuple_get->index_ >= 0 && static_cast<size_t>(tuple_get->index_) < tuple->elements_.size()) {
+        return CollectReferencedOrigins(tuple->elements_[static_cast<size_t>(tuple_get->index_)], origin_map);
+      }
+    }
+    return CollectReferencedOrigins(tuple_get->tuple_, origin_map);
+  }
+
+  auto call = As<Call>(expr);
+  if (!call) return {};
+
+  ParamOrigins origins;
+  for (const auto& arg : call->args_) {
+    MergeOrigins(origins, CollectReferencedOrigins(arg, origin_map));
+  }
+  return origins;
+}
+
+void AnalyzeCallAccess(const CallPtr& call, const AliasOriginMap& origin_map, std::vector<bool>& has_read,
+                       std::vector<bool>& has_write) {
+  if (!call) return;
+
+  const std::string& op_name = call->op_->name_;
+  if (op_name == "tile.load" || op_name == "tensor.read") {
+    if (!call->args_.empty()) {
+      MarkAccess(GetAliasOrigins(call->args_[0], origin_map), has_read);
+    }
+    for (size_t i = 1; i < call->args_.size(); ++i) {
+      MarkAccess(CollectReferencedOrigins(call->args_[i], origin_map), has_read);
+    }
+    return;
+  }
+
+  if (op_name == "tile.store") {
+    if (!call->args_.empty()) {
+      MarkAccess(CollectReferencedOrigins(call->args_[0], origin_map), has_read);
+    }
+    for (size_t i = 1; i + 1 < call->args_.size(); ++i) {
+      MarkAccess(CollectReferencedOrigins(call->args_[i], origin_map), has_read);
+    }
+    if (call->args_.size() < 3) {
+      MarkAccess(CollectReferencedOrigins(GetCallKwargExpr(call, "offsets"), origin_map), has_read);
+    }
+    if (auto write_target = GetWriteTargetExpr(call)) {
+      MarkAccess(GetAliasOrigins(write_target, origin_map), has_write);
+    }
+    return;
+  }
+
+  if (op_name == "tensor.write") {
+    for (size_t i = 1; i < call->args_.size(); ++i) {
+      MarkAccess(CollectReferencedOrigins(call->args_[i], origin_map), has_read);
+    }
+    if (auto write_target = GetWriteTargetExpr(call)) {
+      MarkAccess(GetAliasOrigins(write_target, origin_map), has_write);
+    }
+    return;
+  }
+
+  if (op_name == "tensor.assemble") {
+    for (size_t i = 1; i < call->args_.size(); ++i) {
+      MarkAccess(CollectReferencedOrigins(call->args_[i], origin_map), has_read);
+    }
+    if (!call->args_.empty()) {
+      MarkAccess(GetAliasOrigins(call->args_[0], origin_map), has_write);
+    }
+    return;
+  }
+
+  if (op_name == "tensor.slice" || op_name == "tensor.create") {
+    for (size_t i = 1; i < call->args_.size(); ++i) {
+      MarkAccess(CollectReferencedOrigins(call->args_[i], origin_map), has_read);
+    }
+    return;
+  }
+
+  for (const auto& arg : call->args_) {
+    MarkAccess(CollectReferencedOrigins(arg, origin_map), has_read);
+  }
+}
+
+YieldAliasInfo MergeYieldInfos(const YieldAliasInfo& lhs, const YieldAliasInfo& rhs) {
+  if (!lhs.has_yield) return rhs;
+  if (!rhs.has_yield) return lhs;
+
+  YieldAliasInfo merged;
+  merged.has_yield = true;
+  size_t count = std::max(lhs.origins.size(), rhs.origins.size());
+  merged.origins.resize(count);
+  for (size_t i = 0; i < lhs.origins.size(); ++i) {
+    MergeOrigins(merged.origins[i], lhs.origins[i]);
+  }
+  for (size_t i = 0; i < rhs.origins.size(); ++i) {
+    MergeOrigins(merged.origins[i], rhs.origins[i]);
+  }
+  return merged;
+}
+
+YieldAliasInfo AnalyzeStmtAliases(const StmtPtr& stmt, AliasOriginMap& origin_map,
+                                  std::vector<bool>& has_read, std::vector<bool>& has_write);
+
+YieldAliasInfo AnalyzeStmtSequenceAliases(const std::vector<StmtPtr>& stmts, AliasOriginMap& origin_map,
+                                          std::vector<bool>& has_read, std::vector<bool>& has_write) {
+  YieldAliasInfo last_yield;
+  for (const auto& stmt : stmts) {
+    auto yield_info = AnalyzeStmtAliases(stmt, origin_map, has_read, has_write);
+    if (yield_info.has_yield) {
+      last_yield = yield_info;
+    }
+  }
+  return last_yield;
+}
+
+YieldAliasInfo AnalyzeStmtAliases(const StmtPtr& stmt, AliasOriginMap& origin_map,
+                                  std::vector<bool>& has_read, std::vector<bool>& has_write) {
+  if (!stmt) return {};
+
+  if (auto assign = As<AssignStmt>(stmt)) {
+    if (auto call = As<Call>(assign->value_)) {
+      AnalyzeCallAccess(call, origin_map, has_read, has_write);
+    }
+
+    if (As<TensorType>(assign->var_->GetType())) {
+      auto origins = GetAliasOrigins(assign->value_, origin_map);
+      UpdateTensorAliasOrigin(assign->var_, origins, origin_map);
+    }
+    return {};
+  }
+
+  if (auto eval = As<EvalStmt>(stmt)) {
+    if (auto call = As<Call>(eval->expr_)) {
+      AnalyzeCallAccess(call, origin_map, has_read, has_write);
+    }
+    return {};
+  }
+
+  if (auto seq = As<SeqStmts>(stmt)) {
+    return AnalyzeStmtSequenceAliases(seq->stmts_, origin_map, has_read, has_write);
+  }
+
+  if (auto scope = As<ScopeStmt>(stmt)) {
+    return AnalyzeStmtAliases(scope->body_, origin_map, has_read, has_write);
+  }
+
+  if (auto if_stmt = As<IfStmt>(stmt)) {
+    if (auto cond_call = As<Call>(if_stmt->condition_)) {
+      AnalyzeCallAccess(cond_call, origin_map, has_read, has_write);
+    }
+    auto then_map = origin_map;
+    auto then_yield = AnalyzeStmtAliases(if_stmt->then_body_, then_map, has_read, has_write);
+    YieldAliasInfo else_yield;
+    if (if_stmt->else_body_.has_value()) {
+      auto else_map = origin_map;
+      else_yield = AnalyzeStmtAliases(*if_stmt->else_body_, else_map, has_read, has_write);
+    }
+    auto merged_yield = MergeYieldInfos(then_yield, else_yield);
+    for (size_t i = 0; i < if_stmt->return_vars_.size(); ++i) {
+      ParamOrigins origins;
+      if (merged_yield.has_yield && i < merged_yield.origins.size()) {
+        origins = merged_yield.origins[i];
+      }
+      UpdateTensorAliasOrigin(if_stmt->return_vars_[i], origins, origin_map);
+    }
+    return merged_yield;
+  }
+
+  if (auto for_stmt = As<ForStmt>(stmt)) {
+    if (auto start_call = As<Call>(for_stmt->start_)) {
+      AnalyzeCallAccess(start_call, origin_map, has_read, has_write);
+    }
+    if (auto stop_call = As<Call>(for_stmt->stop_)) {
+      AnalyzeCallAccess(stop_call, origin_map, has_read, has_write);
+    }
+    if (auto step_call = As<Call>(for_stmt->step_)) {
+      AnalyzeCallAccess(step_call, origin_map, has_read, has_write);
+    }
+    if (for_stmt->chunk_size_.has_value()) {
+      if (auto chunk_call = As<Call>(*for_stmt->chunk_size_)) {
+        AnalyzeCallAccess(chunk_call, origin_map, has_read, has_write);
+      }
+    }
+
+    auto body_map = origin_map;
+    std::vector<ParamOrigins> init_origins(for_stmt->iter_args_.size());
+    for (size_t i = 0; i < for_stmt->iter_args_.size(); ++i) {
+      init_origins[i] = GetAliasOrigins(for_stmt->iter_args_[i]->initValue_, origin_map);
+      if (!init_origins[i].empty()) {
+        body_map[for_stmt->iter_args_[i].get()] = init_origins[i];
+      } else {
+        body_map.erase(for_stmt->iter_args_[i].get());
+      }
+    }
+
+    auto yield_info = AnalyzeStmtAliases(for_stmt->body_, body_map, has_read, has_write);
+    for (size_t i = 0; i < for_stmt->return_vars_.size(); ++i) {
+      ParamOrigins origins;
+      if (yield_info.has_yield && i < yield_info.origins.size()) {
+        origins = yield_info.origins[i];
+      }
+      if (origins.empty() && i < init_origins.size()) {
+        origins = init_origins[i];
+      }
+      UpdateTensorAliasOrigin(for_stmt->return_vars_[i], origins, origin_map);
+    }
+    return {};
+  }
+
+  if (auto while_stmt = As<WhileStmt>(stmt)) {
+    if (auto cond_call = As<Call>(while_stmt->condition_)) {
+      AnalyzeCallAccess(cond_call, origin_map, has_read, has_write);
+    }
+
+    auto body_map = origin_map;
+    std::vector<ParamOrigins> init_origins(while_stmt->iter_args_.size());
+    for (size_t i = 0; i < while_stmt->iter_args_.size(); ++i) {
+      init_origins[i] = GetAliasOrigins(while_stmt->iter_args_[i]->initValue_, origin_map);
+      if (!init_origins[i].empty()) {
+        body_map[while_stmt->iter_args_[i].get()] = init_origins[i];
+      } else {
+        body_map.erase(while_stmt->iter_args_[i].get());
+      }
+    }
+
+    auto yield_info = AnalyzeStmtAliases(while_stmt->body_, body_map, has_read, has_write);
+    for (size_t i = 0; i < while_stmt->return_vars_.size(); ++i) {
+      ParamOrigins origins;
+      if (yield_info.has_yield && i < yield_info.origins.size()) {
+        origins = yield_info.origins[i];
+      }
+      if (origins.empty() && i < init_origins.size()) {
+        origins = init_origins[i];
+      }
+      if (As<TensorType>(while_stmt->return_vars_[i]->GetType()) && !origins.empty()) {
+        origin_map[while_stmt->return_vars_[i].get()] = origins;
+      } else {
+        origin_map.erase(while_stmt->return_vars_[i].get());
+      }
+    }
+    return {};
+  }
+
+  if (auto yield = As<YieldStmt>(stmt)) {
+    YieldAliasInfo info;
+    info.has_yield = true;
+    info.origins.reserve(yield->value_.size());
+    for (const auto& value : yield->value_) {
+      info.origins.push_back(GetAliasOrigins(value, origin_map));
+    }
+    return info;
+  }
+
+  return {};
+}
+
+void UpgradeWrittenTensorParamDirections(const std::vector<StmtPtr>& stmts, const std::vector<VarPtr>& params,
+                                         std::vector<ParamDirection>& param_directions) {
+  std::vector<bool> has_read(params.size(), false);
+  std::vector<bool> has_write(params.size(), false);
+  AliasOriginMap origin_map;
+
+  for (size_t i = 0; i < params.size() && i < param_directions.size(); ++i) {
+    if (!As<TensorType>(params[i]->GetType())) {
+      continue;
+    }
+    origin_map[params[i].get()] = ParamOrigins{i};
+  }
+
+  auto analysis_map = origin_map;
+  AnalyzeStmtSequenceAliases(stmts, analysis_map, has_read, has_write);
+
+  for (size_t i = 0; i < params.size() && i < param_directions.size(); ++i) {
+    if (param_directions[i] != ParamDirection::In || !has_write[i]) {
+      continue;
+    }
+    param_directions[i] = has_read[i] ? ParamDirection::InOut : ParamDirection::Out;
+  }
+}
+
 struct ReturnedAssembleLoopRewrite {
   size_t stmt_index;
   std::optional<size_t> dead_init_stmt_index;
@@ -963,11 +1203,12 @@ std::optional<ReturnedAssembleLoopRewrite> RewriteReturnedAssembleLoopToStore(
 
     auto new_return_var = std::make_shared<Var>(for_stmt->return_vars_[0]->name_hint_, out_tensor_type,
                                                 for_stmt->return_vars_[0]->span_);
-    auto new_for_stmt = std::make_shared<ForStmt>(
-        for_stmt->loop_var_, for_stmt->start_, for_stmt->stop_, for_stmt->step_,
-        std::vector<IterArgPtr>{new_iter_arg}, WrapInSeqStmts(new_body_stmts, for_stmt->body_->span_),
-        std::vector<VarPtr>{new_return_var}, for_stmt->span_, for_stmt->kind_, for_stmt->chunk_size_,
-        for_stmt->chunk_policy_, for_stmt->loop_origin_);
+    auto new_for_stmt =
+        std::make_shared<ForStmt>(for_stmt->loop_var_, for_stmt->start_, for_stmt->stop_, for_stmt->step_,
+                                  std::vector<IterArgPtr>{new_iter_arg},
+                                  std::make_shared<SeqStmts>(new_body_stmts, for_stmt->body_->span_),
+                                  std::vector<VarPtr>{new_return_var}, for_stmt->span_, for_stmt->kind_,
+                                  for_stmt->chunk_size_, for_stmt->chunk_policy_, for_stmt->loop_origin_);
 
     std::optional<size_t> dead_init_stmt_index;
     if (auto init_var = As<Var>(old_iter_arg->initValue_)) {
@@ -1143,6 +1384,8 @@ IncoreTransformResult TransformIncoreFunction(const FunctionPtr& func) {
     new_stmts.push_back(std::make_shared<ReturnStmt>(std::vector<ExprPtr>{}, span));
   }
 
+  UpgradeWrittenTensorParamDirections(new_stmts, new_params, new_param_directions);
+
   auto new_body = std::make_shared<SeqStmts>(new_stmts, span);
   auto new_func = std::make_shared<Function>(func->name_, new_params, new_param_directions, new_return_types,
                                              new_body, span, FunctionType::InCore);
@@ -1207,8 +1450,8 @@ std::vector<StmtPtr> UpdateCallSitesBody(
       auto body_stmts = FlattenToStmts(scope->body_);
       auto inner = UpdateCallSitesBody(body_stmts, var_map, incore_added_outputs, transformed_incore_funcs,
                                        op_registry, span, changed);
-      result.push_back(std::make_shared<ScopeStmt>(scope->scope_kind_,
-                                                   WrapInSeqStmts(inner, scope->body_->span_), scope->span_));
+      result.push_back(std::make_shared<ScopeStmt>(
+          scope->scope_kind_, std::make_shared<SeqStmts>(inner, scope->body_->span_), scope->span_));
       continue;
     }
 
@@ -1220,7 +1463,7 @@ std::vector<StmtPtr> UpdateCallSitesBody(
       auto then_stmts = FlattenToStmts(if_stmt->then_body_);
       auto new_then_stmts = UpdateCallSitesBody(then_stmts, then_map, incore_added_outputs,
                                                 transformed_incore_funcs, op_registry, span, changed);
-      auto new_then_body = WrapInSeqStmts(new_then_stmts, if_stmt->then_body_->span_);
+      auto new_then_body = std::make_shared<SeqStmts>(new_then_stmts, if_stmt->then_body_->span_);
 
       std::optional<StmtPtr> new_else_body;
       if (if_stmt->else_body_.has_value()) {
@@ -1228,7 +1471,7 @@ std::vector<StmtPtr> UpdateCallSitesBody(
         auto else_stmts = FlattenToStmts(*if_stmt->else_body_);
         auto new_else_stmts = UpdateCallSitesBody(else_stmts, else_map, incore_added_outputs,
                                                   transformed_incore_funcs, op_registry, span, changed);
-        new_else_body = WrapInSeqStmts(new_else_stmts, (*if_stmt->else_body_)->span_);
+        new_else_body = std::make_shared<SeqStmts>(new_else_stmts, (*if_stmt->else_body_)->span_);
       }
 
       // Update return_vars types based on yield types (check then branch, fall back to else)
@@ -1280,7 +1523,7 @@ std::vector<StmtPtr> UpdateCallSitesBody(
       auto body_stmts = FlattenToStmts(for_stmt->body_);
       auto new_body_stmts = UpdateCallSitesBody(body_stmts, body_map, incore_added_outputs,
                                                 transformed_incore_funcs, op_registry, span, changed);
-      auto new_body = WrapInSeqStmts(new_body_stmts, for_stmt->body_->span_);
+      auto new_body = std::make_shared<SeqStmts>(new_body_stmts, for_stmt->body_->span_);
 
       std::vector<VarPtr> new_return_vars;
       new_return_vars.reserve(for_stmt->return_vars_.size());
@@ -1326,7 +1569,7 @@ std::vector<StmtPtr> UpdateCallSitesBody(
       auto body_stmts = FlattenToStmts(while_stmt->body_);
       auto new_body_stmts = UpdateCallSitesBody(body_stmts, body_map, incore_added_outputs,
                                                 transformed_incore_funcs, op_registry, span, changed);
-      auto new_body = WrapInSeqStmts(new_body_stmts, while_stmt->body_->span_);
+      auto new_body = std::make_shared<SeqStmts>(new_body_stmts, while_stmt->body_->span_);
 
       std::vector<VarPtr> new_return_vars;
       new_return_vars.reserve(while_stmt->return_vars_.size());

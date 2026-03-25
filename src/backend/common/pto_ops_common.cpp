@@ -202,6 +202,56 @@ static std::string MakeCmpsCodegenPTO(const std::string& pto_op_name, const Call
   return "";
 }
 
+// Helper function for tile.assemble → pto.tinsert
+// Inserts source tile into target tile at a given row/col offset (DPS pattern).
+// pto.tinsert semantics: dst[i+row, j+col] = src[i, j]
+// Arguments: args[0] = target (destination base), args[1] = source, args[2] = offset MakeTuple
+static std::string MakeTileAssembleCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
+  auto& codegen = dynamic_cast<codegen::PTOCodegen&>(codegen_base);
+  CHECK(op->args_.size() == 3) << "tile.assemble requires 3 arguments (target, source, offset), got "
+                               << op->args_.size();
+
+  std::string target = codegen.GetExprAsCode(op->args_[0]);
+  std::string src = codegen.GetExprAsCode(op->args_[1]);
+  std::string src_type = codegen.GetExprTypeAnnotation(op->args_[1]);
+  std::string dst = codegen.GetCurrentResultTarget();
+  std::string dst_type = codegen.GetCurrentResultTileBufTypeString();
+
+  auto offset_tuple = ir::As<ir::MakeTuple>(op->args_[2]);
+  INTERNAL_CHECK(offset_tuple) << "tile.assemble third argument must be a tuple (offset)";
+  INTERNAL_CHECK(offset_tuple->elements_.size() >= 2)
+      << "tile.assemble offset tuple must have at least 2 elements (row, col), got "
+      << offset_tuple->elements_.size();
+  std::string row_off = codegen.GetExprAsCode(offset_tuple->elements_[0]);
+  std::string col_off = codegen.GetExprAsCode(offset_tuple->elements_[1]);
+
+  // pto.tinsert writes src into dst at (row, col) in place — dst must already
+  // contain target's data.  When target and dst are different buffers (i.e.
+  // memory reuse did not merge them), copy target → dst first.
+  if (target != dst) {
+    std::string target_type = codegen.GetExprTypeAnnotation(op->args_[0]);
+    std::ostringstream mov;
+    mov << "pto.tmov ins(" << target;
+    if (!target_type.empty()) mov << " : " << target_type;
+    mov << ") outs(" << dst;
+    if (!dst_type.empty()) mov << " : " << dst_type;
+    mov << ")";
+    codegen.Emit(mov.str());
+  }
+
+  // Emit pto.tinsert ins(src, row, col) outs(dst)
+  std::ostringstream oss;
+  oss << "pto.tinsert ins(" << src << ", " << row_off << ", " << col_off;
+  if (!src_type.empty()) {
+    oss << " : " << src_type << ", index, index";
+  }
+  oss << ") outs(" << dst;
+  if (!dst_type.empty()) oss << " : " << dst_type;
+  oss << ")";
+  codegen.Emit(oss.str());
+  return "";
+}
+
 // Helper function for Assign
 static std::string MakeAssignCodegenPTO(const std::string& pto_op_name, const CallPtr& op,
                                         codegen::CodegenBase& codegen_base) {
@@ -649,19 +699,19 @@ static std::string MakeTpushToAivCodegenPTO(const CallPtr& op, codegen::CodegenB
   auto tile = AsVarLike(op->args_[0]);
   INTERNAL_CHECK(tile) << "tpush_to_aiv first argument must be a Var or IterArg";
 
-  const int aiv_idx = op->GetKwarg<int>("aiv_idx", -1);
-  CHECK(aiv_idx >= 0 && aiv_idx <= 1)
-      << "tpush_to_aiv requires 'aiv_idx' attribute (0 or 1), got " << aiv_idx;
+  const int split = op->GetKwarg<int>("split", -1);
+  CHECK(split >= 0 && split <= 2)
+      << "tpush_to_aiv requires 'split' attribute (0=none, 1=up-down, 2=left-right), got " << split;
 
   std::string tile_buf = codegen.GetVarName(tile);
   std::string tile_type = codegen.GetExprTypeAnnotation(op->args_[0]);
 
   std::ostringstream oss;
-  oss << "pto.tpush_to_aiv ins(" << tile_buf;
+  oss << "pto.tpush_to_aiv(" << tile_buf;
   if (!tile_type.empty()) {
     oss << " : " << tile_type;
   }
-  oss << ") {aiv_idx = " << aiv_idx << "}";
+  oss << ") {split = " << split << "}";
   codegen.Emit(oss.str());
 
   return "";
@@ -675,19 +725,19 @@ static std::string MakeTpushToAicCodegenPTO(const CallPtr& op, codegen::CodegenB
   auto tile = AsVarLike(op->args_[0]);
   INTERNAL_CHECK(tile) << "tpush_to_aic first argument must be a Var or IterArg";
 
-  const int aiv_idx = op->GetKwarg<int>("aiv_idx", -1);
-  CHECK(aiv_idx >= 0 && aiv_idx <= 1)
-      << "tpush_to_aic requires 'aiv_idx' attribute (0 or 1), got " << aiv_idx;
+  const int split = op->GetKwarg<int>("split", -1);
+  CHECK(split >= 0 && split <= 2)
+      << "tpush_to_aic requires 'split' attribute (0=none, 1=up-down, 2=left-right), got " << split;
 
   std::string tile_buf = codegen.GetVarName(tile);
   std::string tile_type = codegen.GetExprTypeAnnotation(op->args_[0]);
 
   std::ostringstream oss;
-  oss << "pto.tpush_to_aic ins(" << tile_buf;
+  oss << "pto.tpush_to_aic(" << tile_buf;
   if (!tile_type.empty()) {
     oss << " : " << tile_type;
   }
-  oss << ") {aiv_idx = " << aiv_idx << "}";
+  oss << ") {split = " << split << "}";
   codegen.Emit(oss.str());
 
   return "";
@@ -699,20 +749,19 @@ static std::string MakeTpopFromAicCodegenPTO(const CallPtr& op, codegen::Codegen
 
   CHECK(op->args_.size() == 0) << "tpop_from_aic takes no arguments, got " << op->args_.size();
 
-  const int aiv_idx = op->GetKwarg<int>("aiv_idx", -1);
-  CHECK(aiv_idx >= 0 && aiv_idx <= 1)
-      << "tpop_from_aic requires 'aiv_idx' attribute (0 or 1), got " << aiv_idx;
+  const int split = op->GetKwarg<int>("split", 0);
+  CHECK(split >= 0 && split <= 2)
+      << "tpop_from_aic requires 'split' attribute (0=none, 1=up-down, 2=left-right), got " << split;
 
   std::string result_buf = codegen.GetCurrentResultTarget();
   INTERNAL_CHECK(!result_buf.empty()) << "tpop_from_aic requires assignment target (tile_buf)";
   std::string result_type = codegen.GetCurrentResultTileBufTypeString();
 
   std::ostringstream oss;
-  oss << "pto.tpop_from_aic outs(" << result_buf;
+  oss << result_buf << " = pto.tpop_from_aic {split = " << split << "}";
   if (!result_type.empty()) {
-    oss << " : " << result_type;
+    oss << " -> " << result_type;
   }
-  oss << ") {aiv_idx = " << aiv_idx << "}";
   codegen.Emit(oss.str());
 
   return "";
@@ -724,54 +773,60 @@ static std::string MakeTpopFromAivCodegenPTO(const CallPtr& op, codegen::Codegen
 
   CHECK(op->args_.size() == 0) << "tpop_from_aiv takes no arguments, got " << op->args_.size();
 
-  const int aiv_idx = op->GetKwarg<int>("aiv_idx", -1);
-  CHECK(aiv_idx >= 0 && aiv_idx <= 1)
-      << "tpop_from_aiv requires 'aiv_idx' attribute (0 or 1), got " << aiv_idx;
+  const int split = op->GetKwarg<int>("split", 0);
+  CHECK(split >= 0 && split <= 2)
+      << "tpop_from_aiv requires 'split' attribute (0=none, 1=up-down, 2=left-right), got " << split;
 
   std::string result_buf = codegen.GetCurrentResultTarget();
   INTERNAL_CHECK(!result_buf.empty()) << "tpop_from_aiv requires assignment target (tile_buf)";
   std::string result_type = codegen.GetCurrentResultTileBufTypeString();
 
   std::ostringstream oss;
-  oss << "pto.tpop_from_aiv outs(" << result_buf;
+  oss << result_buf << " = pto.tpop_from_aiv {split = " << split << "}";
   if (!result_type.empty()) {
-    oss << " : " << result_type;
+    oss << " -> " << result_type;
   }
-  oss << ") {aiv_idx = " << aiv_idx << "}";
   codegen.Emit(oss.str());
 
   return "";
 }
 
-// system.tfree_to_aic: Release slot back to Cube producer (called by Vector consumer)
+/// tfree codegen for system.tfree_to_aic: emits pto.tfree(%tile : type) {split = N}
 static std::string MakeTfreeToAicCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
   auto& codegen = dynamic_cast<codegen::PTOCodegen&>(codegen_base);
 
-  CHECK(op->args_.size() == 0) << "tfree_to_aic takes no arguments, got " << op->args_.size();
+  CHECK(op->args_.size() == 1) << "tfree requires 1 argument (tile from tpop), got " << op->args_.size();
+  auto tile = AsVarLike(op->args_[0]);
+  INTERNAL_CHECK(tile) << "tfree first argument must be a Var or IterArg";
 
-  const int aiv_idx = op->GetKwarg<int>("aiv_idx", -1);
-  CHECK(aiv_idx >= 0 && aiv_idx <= 1)
-      << "tfree_to_aic requires 'aiv_idx' attribute (0 or 1), got " << aiv_idx;
+  std::string tile_buf = codegen.GetVarName(tile);
+  std::string tile_type = codegen.GetExprTypeAnnotation(op->args_[0]);
+  int split = codegen.GetTpopSplit(tile.get());
 
   std::ostringstream oss;
-  oss << "pto.tfree_to_aic {aiv_idx = " << aiv_idx << "}";
+  oss << "pto.tfree(" << tile_buf;
+  if (!tile_type.empty()) {
+    oss << " : " << tile_type;
+  }
+  oss << ") {split = " << split << "}";
   codegen.Emit(oss.str());
 
   return "";
 }
 
-// system.tfree_to_aiv: Release slot back to Vector producer (called by Cube consumer)
+// tfree codegen for system.tfree_to_aiv: emits pto.tfree_from_aiv {split = N}
 static std::string MakeTfreeToAivCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
   auto& codegen = dynamic_cast<codegen::PTOCodegen&>(codegen_base);
 
-  CHECK(op->args_.size() == 0) << "tfree_to_aiv takes no arguments, got " << op->args_.size();
+  CHECK(op->args_.size() == 1) << "tfree_to_aiv requires 1 argument (tile from tpop), got "
+                               << op->args_.size();
+  auto tile = AsVarLike(op->args_[0]);
+  INTERNAL_CHECK(tile) << "tfree_to_aiv first argument must be a Var or IterArg";
 
-  const int aiv_idx = op->GetKwarg<int>("aiv_idx", -1);
-  CHECK(aiv_idx >= 0 && aiv_idx <= 1)
-      << "tfree_to_aiv requires 'aiv_idx' attribute (0 or 1), got " << aiv_idx;
+  int split = codegen.GetTpopSplit(tile.get());
 
   std::ostringstream oss;
-  oss << "pto.tfree_to_aiv {aiv_idx = " << aiv_idx << "}";
+  oss << "pto.tfree_from_aiv {split = " << split << "}";
   codegen.Emit(oss.str());
 
   return "";
@@ -783,20 +838,19 @@ static std::string MakeAicInitializePipeCodegenPTO(const CallPtr& op, codegen::C
 
   const int dir_mask = op->GetKwarg<int>("dir_mask", -1);
   const int slot_size = op->GetKwarg<int>("slot_size", -1);
-  const int c2v_consumer_buf = op->GetKwarg<int>("c2v_consumer_buf", -1);
-  const int v2c_consumer_buf = op->GetKwarg<int>("v2c_consumer_buf", -1);
   CHECK(dir_mask >= 0) << "aic_initialize_pipe requires 'dir_mask' attribute";
   CHECK(slot_size > 0) << "aic_initialize_pipe requires 'slot_size' attribute";
 
+  // AIC (Cube): consumer for V2C (reserve), producer for C2V (import)
+  std::string v2c_ssa = codegen.GetReserveBufferSSA();
+  std::string c2v_ssa = codegen.GetImportBufferSSA();
+  if (v2c_ssa.empty()) v2c_ssa = codegen.GetOrEmitI32Constant(0);
+  if (c2v_ssa.empty()) c2v_ssa = codegen.GetOrEmitI32Constant(0);
+
   std::ostringstream oss;
-  oss << "pto.aic_initialize_pipe {dir_mask = " << dir_mask << ", slot_size = " << slot_size;
-  if (c2v_consumer_buf >= 0) {
-    oss << ", c2v_consumer_buf = " << c2v_consumer_buf;
-  }
-  if (v2c_consumer_buf >= 0) {
-    oss << ", v2c_consumer_buf = " << v2c_consumer_buf;
-  }
-  oss << "}";
+  oss << "pto.aic_initialize_pipe {dir_mask = " << dir_mask << ", slot_size = " << slot_size << "}"
+      << " (c2v_consumer_buf = " << c2v_ssa << " : i32"
+      << ", v2c_consumer_buf = " << v2c_ssa << " : i32)";
   codegen.Emit(oss.str());
 
   return "";
@@ -808,20 +862,19 @@ static std::string MakeAivInitializePipeCodegenPTO(const CallPtr& op, codegen::C
 
   const int dir_mask = op->GetKwarg<int>("dir_mask", -1);
   const int slot_size = op->GetKwarg<int>("slot_size", -1);
-  const int c2v_consumer_buf = op->GetKwarg<int>("c2v_consumer_buf", -1);
-  const int v2c_consumer_buf = op->GetKwarg<int>("v2c_consumer_buf", -1);
   CHECK(dir_mask >= 0) << "aiv_initialize_pipe requires 'dir_mask' attribute";
   CHECK(slot_size > 0) << "aiv_initialize_pipe requires 'slot_size' attribute";
 
+  // AIV (Vector): consumer for C2V (reserve), producer for V2C (import)
+  std::string c2v_ssa = codegen.GetReserveBufferSSA();
+  std::string v2c_ssa = codegen.GetImportBufferSSA();
+  if (c2v_ssa.empty()) c2v_ssa = codegen.GetOrEmitI32Constant(0);
+  if (v2c_ssa.empty()) v2c_ssa = codegen.GetOrEmitI32Constant(0);
+
   std::ostringstream oss;
-  oss << "pto.aiv_initialize_pipe {dir_mask = " << dir_mask << ", slot_size = " << slot_size;
-  if (c2v_consumer_buf >= 0) {
-    oss << ", c2v_consumer_buf = " << c2v_consumer_buf;
-  }
-  if (v2c_consumer_buf >= 0) {
-    oss << ", v2c_consumer_buf = " << v2c_consumer_buf;
-  }
-  oss << "}";
+  oss << "pto.aiv_initialize_pipe {dir_mask = " << dir_mask << ", slot_size = " << slot_size << "}"
+      << " (c2v_consumer_buf = " << c2v_ssa << " : i32"
+      << ", v2c_consumer_buf = " << v2c_ssa << " : i32)";
   codegen.Emit(oss.str());
 
   return "";
@@ -1019,36 +1072,17 @@ void RegisterPTOOps(Backend& backend, const std::unordered_set<std::string>& exc
     return MakePrintCodegenPTO("pto.tprint", op, codegen);
   });
 
-  // In-place accumulation ops (matmul_acc, gemv_acc): the CUBE engine
-  // accumulates into the output buffer, NOT from a separate accumulator input.
-  // When memory reuse cannot merge c_in and c_out (touching lifetimes treated
-  // as overlapping), they get separate buffers.  We emit a pto.tmov to copy
-  // c_in → c_out so the hardware reads the correct accumulator value.
+  // In-place accumulation ops (matmul_acc, gemv_acc): ptoas expects the
+  // accumulator in ins() to be the same SSA value as outs().  InitMemRef
+  // guarantees that the output shares the MemRef of the accumulator input
+  // (via set_output_reuses_input), so we use the result buffer (dst) as the
+  // accumulator operand instead of the IR-level input arg.
   auto make_acc_codegen = [](const std::string& pto_op) {
     return [pto_op](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) -> std::string {
       auto& codegen = dynamic_cast<codegen::PTOCodegen&>(codegen_base);
       CHECK(op->args_.size() == 3) << pto_op << " requires 3 arguments: acc, lhs, rhs";
 
-      std::string acc = codegen.GetExprAsCode(op->args_[0]);
       std::string dst = codegen.GetCurrentResultTarget();
-
-      // Copy accumulator to output buffer when they differ
-      if (acc != dst) {
-        std::string acc_type = codegen.GetExprTypeAnnotation(op->args_[0]);
-        std::string dst_type = codegen.GetCurrentResultTileBufTypeString();
-        std::ostringstream mov;
-        mov << "pto.tmov ins(" << acc;
-        if (!acc_type.empty()) mov << " : " << acc_type;
-        mov << ") outs(" << dst;
-        if (!dst_type.empty()) mov << " : " << dst_type;
-        mov << ")";
-        codegen.Emit(mov.str());
-      }
-
-      // Emit the accumulation instruction with dst (accumulator), lhs, rhs
-      // as ins() operands.  ptoas expects all three in ins(); the hardware
-      // reads the accumulator from the output buffer, but the MLIR op still
-      // models it as an input for correct data-flow tracking.
       std::string lhs = codegen.GetExprAsCode(op->args_[1]);
       std::string rhs = codegen.GetExprAsCode(op->args_[2]);
       std::string dst_type = codegen.GetCurrentResultTileBufTypeString();
@@ -1117,15 +1151,32 @@ void RegisterPTOOps(Backend& backend, const std::unordered_set<std::string>& exc
     CHECK(size > 0) << "reserve_buffer requires positive 'size' attribute, got " << size;
     CheckSafeIdentifier(name, "reserve_buffer 'name'");
 
-    std::ostringstream oss;
-    oss << "pto.reserve_buffer {name = \"" << name << "\", size = " << size;
-    if (base >= 0) {
-      oss << ", base = " << base;
-    } else {
-      oss << ", base = auto";
+    std::string ssa_name = codegen.GetCurrentResultTarget();
+    if (ssa_name.empty()) {
+      // EvalStmt context — derive SSA name from buffer name hint
+      ssa_name = codegen.NewNamedTemp(name);
     }
-    oss << "}";
+
+    std::string location;
+    if (codegen.IsAICFunction()) {
+      location = "mat";
+    } else if (codegen.IsAIVFunction()) {
+      location = "vec";
+    } else {
+      location = "undefined";
+    }
+
+    std::ostringstream oss;
+    oss << ssa_name << " = pto.reserve_buffer {name = \"" << name << "\", size = " << size
+        << ", location = #pto.address_space<" << location << ">";
+    if (base >= 0) {
+      oss << ", auto = false, base = " << base;
+    } else {
+      oss << ", auto = true";
+    }
+    oss << "} -> i32";
     codegen.Emit(oss.str());
+    codegen.RecordReserveBufferSSA(ssa_name);
 
     return std::string("");
   });
@@ -1140,9 +1191,16 @@ void RegisterPTOOps(Backend& backend, const std::unordered_set<std::string>& exc
     CheckSafeIdentifier(name, "import_peer_buffer 'name'");
     CheckSafeIdentifier(peer_func, "import_peer_buffer 'peer_func'");
 
+    std::string ssa_name = codegen.GetCurrentResultTarget();
+    if (ssa_name.empty()) {
+      ssa_name = codegen.NewNamedTemp(name + "_import");
+    }
+
     std::ostringstream oss;
-    oss << "pto.import_peer_buffer {name = \"" << name << "\", peer_func = \"" << peer_func << "\"}";
+    oss << ssa_name << " = pto.import_reserved_buffer {name = \"" << name << "\", peer_func = @" << peer_func
+        << "} -> i32";
     codegen.Emit(oss.str());
+    codegen.RecordImportBufferSSA(ssa_name);
 
     return std::string("");
   });
@@ -1166,11 +1224,13 @@ void RegisterPTOOps(Backend& backend, const std::unordered_set<std::string>& exc
     std::string result_target = codegen.GetCurrentResultTarget();
     std::string result_type = codegen.GetCurrentResultTileBufTypeStringFromTileType();
 
-    if (src == result_target && !result_type.empty()) {
-      result_target = codegen.NewTemp();
+    // With per-var alloc model, prefer the pre-declared alloc SSA if its type
+    // matches the slice result type
+    auto existing_type = codegen.GetSSATileBufType(result_target);
+    if (!result_type.empty() && existing_type != result_type) {
+      result_target = codegen.AllocNewTileBuf(result_type, "slice_buf");
       codegen.SetCurrentResultBuf(result_target);
-    }
-    if (!result_type.empty()) {
+    } else if (!result_type.empty()) {
       codegen.RegisterTileBufType(result_target, result_type);
     }
 
@@ -1187,18 +1247,26 @@ void RegisterPTOOps(Backend& backend, const std::unordered_set<std::string>& exc
     codegen.Emit(oss.str());
     return std::string("");
   });
+  reg("tile.assemble", [](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
+    return MakeTileAssembleCodegenPTO(op, codegen);
+  });
   reg("tile.reshape", [](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) {
     auto& codegen = dynamic_cast<codegen::PTOCodegen&>(codegen_base);
     CHECK(op->args_.size() == 2) << "Operation:[tile.reshape] requires 2 arguments (tile, shape), but got "
                                  << op->args_.size();
-    std::string src = codegen.GetExprAsCode(op->args_[0]);
     std::string result_target = codegen.GetCurrentResultTarget();
-    // Use the TileType-based method to get the correct reshaped output type,
-    // bypassing the memref lookup which would return the pre-reshape shape.
     std::string result_type = codegen.GetCurrentResultTileBufTypeStringFromTileType();
-    // Get the correct input type directly from the source variable's TileType,
-    // bypassing the memref_to_tile_type_ lookup which may return the wrong shape
-    // when input and output share the same MemRef.
+
+    // With per-var alloc model, the result variable already has a pre-declared
+    // alloc_tile with the correct reshaped type and shared addr. If the types
+    // match, the reshape is a no-op at the PTO level.
+    auto existing_type = codegen.GetSSATileBufType(result_target);
+    if (!existing_type.empty() && existing_type == result_type) {
+      return std::string("");
+    }
+
+    // Fallback: emit pto.treshape for cases without pre-declared alloc
+    std::string src = codegen.GetExprAsCode(op->args_[0]);
     std::string src_type;
     if (auto src_var = AsVarLike(op->args_[0])) {
       if (auto tile_type = ir::As<ir::TileType>(src_var->GetType())) {
@@ -1207,16 +1275,10 @@ void RegisterPTOOps(Backend& backend, const std::unordered_set<std::string>& exc
         }
       }
     }
-    // tile.reshape is a view-like op that produces a new SSA value, not an in-place write.
-    // If the target variable already has a preallocated tile buffer name, emitting
-    // `result_target = pto.treshape ...` would redefine the same SSA value after
-    // the earlier `pto.alloc_tile`. Always materialize reshape results with a fresh
-    // SSA name when codegen assigned a MemRef-backed result target.
+
     if (!result_type.empty()) {
       result_target = codegen.NewNamedTemp("reshape_buf");
       codegen.SetCurrentResultBuf(result_target);
-    }
-    if (!result_type.empty()) {
       codegen.RegisterTileBufType(result_target, result_type);
     }
     std::ostringstream oss;

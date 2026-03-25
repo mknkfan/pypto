@@ -24,8 +24,6 @@ from pypto.ir.op.system_ops import (
     bar_v,
     sync_dst,
     sync_src,
-    tfree_to_aic,
-    tfree_to_aiv,
 )
 from pypto.pypto_core import DataType
 from pypto.pypto_core.ir import Call, Span
@@ -87,21 +85,31 @@ __all__ = [
 ]
 
 
-def tpush_to_aiv(tile: Tile, *, aiv_idx: int, span: Span | None = None) -> Call:
+def tpush_to_aiv(tile: Tile, *, split: int, span: Span | None = None) -> Call:
     """Push tile data from AIC to AIV via cross-core pipe."""
-    return _ir_ops.tpush_to_aiv(tile.unwrap(), aiv_idx=aiv_idx, span=span)
+    return _ir_ops.tpush_to_aiv(tile.unwrap(), split=split, span=span)
 
 
-def tpush_to_aic(tile: Tile, *, aiv_idx: int, span: Span | None = None) -> Call:
+def tpush_to_aic(tile: Tile, *, split: int, span: Span | None = None) -> Call:
     """Push tile data from AIV to AIC via cross-core pipe."""
-    return _ir_ops.tpush_to_aic(tile.unwrap(), aiv_idx=aiv_idx, span=span)
+    return _ir_ops.tpush_to_aic(tile.unwrap(), split=split, span=span)
+
+
+def tfree_to_aic(tile: Tile, span: Span | None = None) -> Call:
+    """Release ring buffer slot back to AIC producer."""
+    return _ir_ops.tfree_to_aic(tile.unwrap(), span=span)
+
+
+def tfree_to_aiv(tile: Tile, span: Span | None = None) -> Call:
+    """Release ring buffer slot back to AIV producer."""
+    return _ir_ops.tfree_to_aiv(tile.unwrap(), span=span)
 
 
 def tpop_from_aic(
     *,
     shape: list[int] | None = None,
     dtype: DataType | None = None,
-    aiv_idx: int,
+    split: int = 0,
     span: Span | None = None,
 ) -> Tile:
     """Pop tile data from AIC cross-core pipe into AIV.
@@ -109,10 +117,10 @@ def tpop_from_aic(
     Args:
         shape: Shape of the tile to receive
         dtype: Data type of the tile to receive
-        aiv_idx: Target AIV core index
+        split: Split mode (0=none, 1=up-down, 2=left-right)
         span: Optional source span
     """
-    call = _ir_ops.tpop_from_aic(shape=shape, dtype=dtype, aiv_idx=aiv_idx, span=span)
+    call = _ir_ops.tpop_from_aic(shape=shape, dtype=dtype, split=split, span=span)
     return Tile(expr=call)
 
 
@@ -120,7 +128,7 @@ def tpop_from_aiv(
     *,
     shape: list[int] | None = None,
     dtype: DataType | None = None,
-    aiv_idx: int,
+    split: int = 0,
     span: Span | None = None,
 ) -> Tile:
     """Pop tile data from AIV cross-core pipe into AIC.
@@ -128,10 +136,10 @@ def tpop_from_aiv(
     Args:
         shape: Shape of the tile to receive
         dtype: Data type of the tile to receive
-        aiv_idx: Source AIV core index
+        split: Split mode (0=none, 1=up-down, 2=left-right)
         span: Optional source span
     """
-    call = _ir_ops.tpop_from_aiv(shape=shape, dtype=dtype, aiv_idx=aiv_idx, span=span)
+    call = _ir_ops.tpop_from_aiv(shape=shape, dtype=dtype, split=split, span=span)
     return Tile(expr=call)
 
 

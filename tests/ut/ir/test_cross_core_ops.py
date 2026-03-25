@@ -20,7 +20,7 @@ def test_tpush_ops_return_unknown_type():
     tile_var = ir.Var("t", tile_type, span)
 
     for op_name in ["tile.tpush_to_aiv", "tile.tpush_to_aic"]:
-        call = ir.create_op_call(op_name, [tile_var], {"aiv_idx": 0}, span)
+        call = ir.create_op_call(op_name, [tile_var], {"split": 0}, span)
         assert isinstance(call.type, ir.UnknownType)
 
 
@@ -31,7 +31,7 @@ def test_tpop_ops_return_tile_type():
 
     for op_name in ["tile.tpop_from_aic", "tile.tpop_from_aiv"]:
         op = ir.get_op(op_name)
-        call = ir.Call(op, [], {"aiv_idx": 0}, tile_type, span)
+        call = ir.Call(op, [], {"split": 0}, tile_type, span)
         assert isinstance(call.type, ir.TileType)
         assert call.type.shape == [64]
         assert call.type.dtype == DataType.FP32

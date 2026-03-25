@@ -68,7 +68,7 @@ def pytest_addoption(parser):
         "--platform",
         action="store",
         default="a2a3",
-        choices=["a2a3sim", "a2a3"],
+        choices=["a2a3sim", "a2a3", "a5sim", "a5"],
         help="Target platform for tests (default: a2a3sim)",
     )
     parser.addoption(
@@ -200,6 +200,7 @@ def tensor_shape(request):
 def pytest_configure(config):
     """Register custom markers."""
     config.addinivalue_line("markers", "hardware: mark test as requiring hardware (--platform=a2a3)")
+    config.addinivalue_line("markers", "a5: mark test as requiring Ascend 950 (--platform=a5 or a5sim)")
     config.addinivalue_line("markers", "slow: mark test as slow")
     config.addinivalue_line("markers", "fuzz: mark test as fuzz test")
 
@@ -209,7 +210,10 @@ def pytest_collection_modifyitems(config, items):
     platform = config.getoption("--platform")
 
     skip_hardware = pytest.mark.skip(reason="hardware tests require --platform=a2a3")
+    skip_a5 = pytest.mark.skip(reason="Ascend 950 tests require --platform=a5 or a5sim")
 
     for item in items:
         if "hardware" in item.keywords and platform != "a2a3":
             item.add_marker(skip_hardware)
+        if "a5" in item.keywords and not platform.startswith("a5"):
+            item.add_marker(skip_a5)

@@ -71,6 +71,7 @@ find_package(nanobind CONFIG REQUIRED)
 
 # Include directories
 include_directories(${CMAKE_SOURCE_DIR}/include)
+include_directories(${CMAKE_SOURCE_DIR})
 
 # External dependencies
 include(${CMAKE_SOURCE_DIR}/cmake/libbacktrace.cmake)
@@ -115,16 +116,23 @@ set(PYPTO_SOURCES
     src/ir/op/testing.cpp
     src/ir/op/type_inference.cpp
 
+    # IR - Arith
+    src/ir/arith/analyzer.cpp
+    src/ir/arith/const_int_bound.cpp
+    src/ir/arith/modular_set.cpp
+    src/ir/arith/rewrite_simplify.cpp
+    src/ir/arith/canonical_simplify.cpp
+
     # IR - Transforms
     src/ir/transforms/allocate_memory_addr_pass.cpp
-    src/ir/transforms/basic_memory_reuse_pass.cpp
+    src/ir/transforms/memory_reuse_pass.cpp
     src/ir/transforms/convert_tensor_to_tile_ops_pass.cpp
     src/ir/transforms/convert_to_ssa_pass.cpp
     src/ir/transforms/ctrl_flow_transform_pass.cpp
-    src/ir/transforms/dependency_analyzer.cpp
     src/ir/transforms/flatten_call_expr_pass.cpp
     src/ir/transforms/infer_tile_memory_space_pass.cpp
     src/ir/transforms/init_memref.cpp
+    src/ir/transforms/legalize_pto_buffer_reuse_pass.cpp
     src/ir/transforms/ir_property.cpp
     src/ir/transforms/insert_sync_pass.cpp
     src/ir/transforms/mutator.cpp
@@ -146,9 +154,9 @@ set(PYPTO_SOURCES
     src/ir/transforms/structural_equal.cpp
     src/ir/transforms/structural_hash.cpp
     src/ir/transforms/utils/deep_clone_utils.cpp
-    src/ir/transforms/utils/substitute_vars.cpp
     src/ir/transforms/utils/normalize_stmt_structure.cpp
     src/ir/transforms/utils/parent_stmt_analysis.cpp
+    src/ir/transforms/utils/transform_utils.cpp
     src/ir/transforms/visitor.cpp
 
     # IR - Reporter

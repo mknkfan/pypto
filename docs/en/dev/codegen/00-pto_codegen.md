@@ -88,11 +88,16 @@ class MyKernel:
         tile_c = pl.add(tile_a, tile_b)
         pl.store(tile_c, [0, 0], a)
 
-# Compile with PTO backend and PTOAS optimization
-output_dir = compile(MyKernel, strategy=OptimizationStrategy.PTOAS, backend_type=BackendType.Ascend910B_PTO)
+# Compile with PTO backend and DebugTileOptimization (debug only)
+output_dir = compile(
+    MyKernel,
+    strategy=OptimizationStrategy.DebugTileOptimization,
+    backend_type=BackendType.Ascend910B_PTO,
+)
 ```
 
 The `compile()` function automatically applies the selected optimization strategy and invokes the appropriate codegen based on `backend_type`.
+Use `Default` for normal PTO compilation; `DebugTileOptimization` is intended only for pass-pipeline debugging.
 
 ### Direct Codegen Access
 
@@ -121,22 +126,24 @@ print(pto_code)
 
 | PyPTO Operation | Generated PTO-ISA | Description |
 | --------------- | ----------------- | ----------- |
-| `tile.tpush_to_aiv(tile, aiv_idx=N)` | `pto.tpush_to_aiv ins(%tile : type) {aiv_idx = N}` | Cube → Vector push |
-| `tile.tpush_to_aic(tile, aiv_idx=N)` | `pto.tpush_to_aic ins(%tile : type) {aiv_idx = N}` | Vector → Cube push |
-| `tile.tpop_from_aic(aiv_idx=N)` | `pto.tpop_from_aic outs(%buf : type) {aiv_idx = N}` | Pop from Cube pipe |
-| `tile.tpop_from_aiv(aiv_idx=N)` | `pto.tpop_from_aiv outs(%buf : type) {aiv_idx = N}` | Pop from Vector pipe |
+| `tile.tpush_to_aiv(tile, split=N)` | `pto.tpush_to_aiv ins(%tile : type) {split = N}` | Cube → Vector push |
+| `tile.tpush_to_aic(tile, split=N)` | `pto.tpush_to_aic ins(%tile : type) {split = N}` | Vector → Cube push |
+| `tile.tpop_from_aic(split=N)` | `pto.tpop_from_aic outs(%buf : type) {split = N}` | Pop from Cube pipe |
+| `tile.tpop_from_aiv(split=N)` | `pto.tpop_from_aiv outs(%buf : type) {split = N}` | Pop from Vector pipe |
 | `system.tfree_to_aic(aiv_idx=N)` | `pto.tfree_to_aic {aiv_idx = N}` | Release slot to Cube |
 | `system.tfree_to_aiv(aiv_idx=N)` | `pto.tfree_to_aiv {aiv_idx = N}` | Release slot to Vector |
-| `system.aic_initialize_pipe(...)` | `pto.aic_initialize_pipe {dir_mask = D, slot_size = S, ...}` | Cube pipe init |
-| `system.aiv_initialize_pipe(...)` | `pto.aiv_initialize_pipe {dir_mask = D, slot_size = S, ...}` | Vector pipe init |
-| `system.reserve_buffer(...)` | `pto.reserve_buffer {name = "N", size = S, base = B}` | Reserve buffer |
-| `system.import_peer_buffer(...)` | `pto.import_peer_buffer {name = "N", peer_func = "F"}` | Import peer buffer |
+| `system.aic_initialize_pipe(...)` | `pto.aic_initialize_pipe {dir_mask = D, slot_size = S} (c2v_consumer_buf = %ssa : i32, v2c_consumer_buf = %ssa : i32)` | Cube pipe init |
+| `system.aiv_initialize_pipe(...)` | `pto.aiv_initialize_pipe {dir_mask = D, slot_size = S} (c2v_consumer_buf = %ssa : i32, v2c_consumer_buf = %ssa : i32)` | Vector pipe init |
+| `system.reserve_buffer(...)` | `%name = pto.reserve_buffer {name = "N", size = S, location = #pto.address_space<loc>, auto = A} -> i32` | Reserve buffer |
+| `system.import_peer_buffer(...)` | `%name = pto.import_reserved_buffer {name = "N", peer_func = @F} -> i32` | Import peer buffer |
 
 **Notes:**
 
 - Push ops use `ins()` clause with typed tile buffer; pop ops use `outs()` clause
-- `initialize_pipe` only emits `c2v_consumer_buf`/`v2c_consumer_buf` when the value is ≥ 0 (i.e., not AUTO)
-- `reserve_buffer` emits `base = auto` when base is AUTO (-1), or `base = <value>` for explicit addresses
+- `reserve_buffer` and `import_reserved_buffer` return `i32` SSA values; `initialize_pipe` references them as operands
+- `reserve_buffer` emits `auto = true` when base is AUTO, or `auto = false, base = <value>` for explicit addresses
+- `reserve_buffer` location is `mat` for AIC functions, `vec` for AIV/InCore functions
+- `import_reserved_buffer` uses MLIR symbol syntax (`@func_name`) for `peer_func`
 - Buffer name and peer_func strings are validated by `CheckSafeIdentifier` (alphanumeric + underscore only)
 
 ### Parameter Type Handling
@@ -169,19 +176,24 @@ For each `TensorType` parameter, the codegen generates:
 
 ### Allocation Generation
 
-Based on MemRef objects attached to TileType variables. The codegen derives tile dimensions and dtype from the associated TileType:
+Based on TileType variables collected from the function body. Each tile variable gets its own `pto.alloc_tile` instruction with an explicit `addr` attribute derived from the variable's MemRef. Variables sharing the same MemRef share the same address:
 
 ```mlir
-%0 = pto.alloc_tile : !pto.tile_buf<loc=vec, dtype=f32, rows=32, cols=32,
-                       v_row=32, v_col=32, blayout=row_major,
-                       slayout=none_box, fractal=512, pad=0>
+%mi_tile = pto.alloc_tile addr = %c8320 : !pto.tile_buf<loc=vec, dtype=f32, rows=16, cols=1,
+                      v_row=16, v_col=1, blayout=col_major,
+                      slayout=none_box, fractal=512, pad=0>
+%mi_tile_nd = pto.alloc_tile addr = %c8320 : !pto.tile_buf<loc=vec, dtype=f32, rows=1, cols=16,
+                      v_row=1, v_col=16, blayout=row_major,
+                      slayout=none_box, fractal=512, pad=0>
 ```
 
-**MemRef → alloc_tile mapping**:
+**Tile variable → alloc_tile mapping**:
 
 - Memory space (`TileType.memory_space_`) → `loc` attribute (using PTO address space names)
-- Tile dtype and dimensions derived from associated TileType metadata
-- One allocation per unique MemRef
+- Tile dtype and dimensions derived from each variable's own TileType metadata
+- One allocation per tile variable (not per unique MemRef)
+- `addr` attribute from `MemRef.addr_`, emitted as `arith.constant ... : i64`
+- Variables sharing the same MemRef produce the same `addr` SSA value
 
 ### Load Operation Transformation
 
@@ -469,7 +481,7 @@ The wrapper unpacks `int64_t* args` following the same convention as CCECodegen:
 
 ### Implementation
 
-**Module**: `python/pypto/ir/pto_codegen.py`
+**Module**: `python/pypto/backend/pto_backend.py`
 
 Key functions:
 

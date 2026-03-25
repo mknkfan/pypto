@@ -147,12 +147,23 @@ Pass CreateProgramPass(std::function<ProgramPtr(const ProgramPtr&)> transform, c
 Pass InitMemRef();
 
 /**
- * @brief Create a basic memory reuse pass
+ * @brief Create a memory reuse pass
  *
  * Uses dependency analysis to identify memory reuse opportunities.
  * Variables with non-overlapping lifetimes in the same memory space can share MemRef objects.
  */
-Pass BasicMemoryReuse();
+Pass MemoryReuse();
+
+/**
+ * @brief Create a PTO buffer reuse legalisation pass
+ *
+ * After generic MemoryReuse, multiple tile variables with different
+ * TileBufSignatures may share the same MemRef.  PTO codegen requires that
+ * every non-view writer sharing a MemRef produces the same typed alloc_tile
+ * signature.  This pass detects illegal cross-type sharing and splits the
+ * offending MemRef into distinct allocations.
+ */
+Pass LegalizePTOBufferReuse();
 
 /**
  * @brief Create an insert sync pass

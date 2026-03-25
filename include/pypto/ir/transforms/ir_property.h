@@ -26,7 +26,7 @@ namespace ir {
  * Each value represents a property that the IR may or may not satisfy.
  * Passes can declare which properties they require, produce, and invalidate.
  * Not all passes produce properties — performance optimization passes
- * (BasicMemoryReuse, InsertSync) only have requirements but don't
+ * (MemoryReuse, InsertSync) only have requirements but don't
  * produce new verifiable properties. This is by design.
  */
 enum class IRProperty : uint64_t {
@@ -175,8 +175,9 @@ enum class VerificationLevel {
 /**
  * @brief Get the set of properties automatically verified during compilation
  *
- * Returns {SSAForm, TypeChecked, AllocatedMemoryAddr, BreakContinueValid,
- * NoRedundantBlocks} — lightweight checks that catch the most common IR errors.
+ * Returns {SSAForm, TypeChecked, MixedKernelExpanded, AllocatedMemoryAddr,
+ * BreakContinueValid, NoRedundantBlocks} — lightweight checks that catch the
+ * most common IR errors.
  */
 const IRPropertySet& GetVerifiedProperties();
 

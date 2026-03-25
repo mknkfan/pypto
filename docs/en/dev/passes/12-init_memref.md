@@ -7,23 +7,18 @@ Initializes MemRef for all variables and creates alloc operations with unallocat
 This pass performs three tasks:
 
 1. **Normalizes statement structure** (calls NormalizeStmtStructure internally)
-2. **Initializes MemRef** for TileType and TensorType variables with appropriate memory spaces
+2. **Initializes MemRef** for TileType and TensorType variables
 3. **Creates `tile.alloc` operations** for each non-DDR MemRef with `addr=-1` (unallocated)
 
-Memory space assignment rules:
+Memory space is read from `TileType::memory_space_` (set by InferTileMemorySpace). Variables without `memory_space` default to DDR.
 
-- **Function parameters** → DDR
-- **tile.store return values** → DDR (special-cased, returns TensorType)
-- **Other tile ops** → Resolved via OpRegistry memory specs (see `OpMemorySpaceSpec`)
-- **Non-tile variables** → DDR (default)
-
-**Requires**: TypeChecked, SSAForm, SplitIncoreOrch, IncoreTileOps.
+**Requires**: SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D, TileMemoryInferred.
 
 **Produces**: HasMemRefs, NormalizedStmtStructure.
 
 **Invalidates**: SSAForm (new MemRef variables are introduced).
 
-**When to use**: Run after SSA conversion, outlining, and block-op conversion. Required before BasicMemoryReuse, InsertSync, and AllocateMemoryAddr.
+**When to use**: Run after SSA conversion, outlining, and block-op conversion. Required before MemoryReuse, InsertSync, and AllocateMemoryAddr.
 
 ## API
 
@@ -49,11 +44,14 @@ program_with_memrefs = init_pass(program)
 ## Algorithm
 
 1. **Normalize structure**: Call `NormalizeStmtStructure` to ensure flat `SeqStmts` structure
-2. **Analyze usage**: Traverse function body to determine memory space for each variable
-3. **Initialize MemRef**: Create MemRef objects (addr=-1) and attach to variable types
-4. **Collect non-DDR MemRefs**: Gather unique MemRef objects from TileType variables that are not in DDR
-5. **Create alloc statements**: For each non-DDR MemRef, create `tile.alloc(memspace, -1, size, id)`
-6. **Prepend allocs**: Insert alloc statements at the beginning of the function body's top-level `SeqStmts`
+2. **Initialize MemRef**: Read `memory_space` from `TileType` (set by InferTileMemorySpace), create MemRef objects (addr=-1) and attach to variable types
+   - **tile.store**: result shares MemRef with the output tensor argument
+   - **View ops** (e.g. `tile.reshape`): output shares MemRef with the input tile
+   - **Accumulate ops** (e.g. `tile.matmul_acc`, `tile.gemv_acc`): output shares MemRef with the accumulator input (specified by `output_reuses_input_arg` registry attribute)
+   - **ForStmt/IfStmt return_vars**: patched to share MemRef with corresponding yield values
+3. **Collect non-DDR MemRefs**: Gather unique MemRef objects from TileType variables that are not in DDR
+4. **Create alloc statements**: For each non-DDR MemRef, create `tile.alloc(memspace, -1, size, id)`
+5. **Prepend allocs**: Insert alloc statements at the beginning of the function body's top-level `SeqStmts`
 
 ## Example
 
@@ -89,6 +87,7 @@ Key observations:
 - `addr=-1` indicates addresses are not yet assigned (done later by AllocateMemoryAddr)
 - DDR MemRefs (params) do not get `tile.alloc` statements
 - `tile.store` result shares MemRef with the output tensor parameter
+- Accumulate ops (`matmul_acc`, `gemv_acc`) share MemRef with their accumulator input, preventing redundant Acc allocs
 - Alloc statements are placed at the beginning of the function body's top-level `SeqStmts`
 
 ## ForStmt Loop-Carry Variables
@@ -107,7 +106,7 @@ ForStmt has four loop-carry related variables with specific MemRef sharing rules
 - Group A: initValue + iter_arg (same MemRef)
 - Group B: yield value + return_var (same MemRef)
 
-Group A and B may have different MemRefs. The yield-to-iter_arg mismatch is resolved later by BasicMemoryReuse (which inserts `tile.move` if needed).
+Group A and B may have different MemRefs. The yield-to-iter_arg mismatch is resolved later by MemoryReuse (which inserts `tile.move` if needed).
 
 ## Implementation
 
@@ -120,8 +119,8 @@ Pass InitMemRef();
 **Implementation**: `src/ir/transforms/init_memref.cpp`
 
 - `NormalizeStmtStructure` is called internally before MemRef initialization
-- `MemRefUsageVisitor` analyzes memory space for each variable
-- `InitMemRefMutator` creates MemRef objects and attaches to types
+- `InitMemRefMutator` reads `memory_space` from `TileType` and creates MemRef objects
+  - Handles MemRef sharing for `tile.store`, view ops, accumulate ops, and ForStmt/IfStmt yield values
 - `NonDDRMemRefCollector` collects unique non-DDR MemRefs
 - `CreateAllocStatement` / `InsertAllocsIntoBody` create and insert alloc ops
 
@@ -138,4 +137,5 @@ passes.def("init_mem_ref", &pass::InitMemRef, "Initialize MemRef for variables")
 - Tests tile.alloc statements are created for non-DDR MemRefs
 - Tests normalized `SeqStmts` structure
 - Tests tile.store result shares MemRef with output param
+- Tests accumulate op (matmul_acc) MemRef sharing with accumulator input
 - Tests ForStmt loop-carry MemRef relationships (initValue/iter_arg sharing, yield/return_var sharing)

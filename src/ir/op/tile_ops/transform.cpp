@@ -352,13 +352,24 @@ TypePtr DeduceTileAssembleType(const std::vector<ExprPtr>& args,
   CHECK(offset_tuple_type) << "tile.assemble requires offset to be TupleType, but got "
                            << args[2]->GetType()->TypeName();
 
+  CHECK(As<MakeTuple>(args[2])) << "tile.assemble offset must be a literal tuple (e.g., (row, col)), "
+                                << "not a variable or computed expression";
+
   ValidateIndexTupleElements(offset_tuple_type, "tile.assemble", "offset");
 
   CHECK(target_type->dtype_ == source_type->dtype_)
       << "tile.assemble requires target and source to have the same dtype, but got "
       << target_type->dtype_.ToString() << " and " << source_type->dtype_.ToString();
 
-  return std::make_shared<TileType>(target_type->shape_, target_type->dtype_);
+  // Inherit layout metadata (blayout, slayout, fractal, pad) from the target so that
+  // the result type carries the correct tile_buf type annotation for codegen.
+  TileView tile_view;
+  if (target_type->tile_view_.has_value()) {
+    tile_view = *target_type->tile_view_;
+  }
+  tile_view.valid_shape = target_type->shape_;
+  return std::make_shared<TileType>(target_type->shape_, target_type->dtype_, std::nullopt, tile_view,
+                                    target_type->memory_space_);
 }
 
 REGISTER_OP("tile.assemble")

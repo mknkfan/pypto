@@ -17,7 +17,7 @@
 - **属性跟踪**：Pass 声明所需、产生和失效的属性
 - **插桩**：PassContext 持有 PassInstrument，在每个 Pass 执行前/后运行
 - **运行时验证**：VerificationInstrument 根据实际 IR 检查属性
-- **基于策略的流水线**：预配置的优化级别（Default/PTOAS）
+- **基于策略的流水线**：预配置的优化级别（`Default`、`DebugTileOptimization`、`TileCCEOptimization`）
 - **不可变变换**：返回新的 IR 节点，不就地修改
 
 ## IRProperty 系统
@@ -72,7 +72,7 @@ struct PassProperties {
 | ResolveBackendOpLayouts | SSAForm, IncoreTileOps, SplitIncoreOrch, TileOps2D | SSAForm, IncoreTileOps, SplitIncoreOrch, TileOps2D | NormalizedStmtStructure |
 | ExpandMixedKernel | SSAForm, IncoreTileOps, SplitIncoreOrch, TileOps2D | SSAForm, MixedKernelExpanded | — |
 | InitMemRef | TypeChecked, SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D | HasMemRefs | SSAForm |
-| BasicMemoryReuse | TypeChecked, SplitIncoreOrch, IncoreTileOps, HasMemRefs, TileOps2D | — | — |
+| MemoryReuse | TypeChecked, SplitIncoreOrch, IncoreTileOps, HasMemRefs, TileOps2D | — | — |
 | InsertSync | TypeChecked, SplitIncoreOrch, IncoreTileOps, HasMemRefs, TileOps2D | — | — |
 | AllocateMemoryAddr | TypeChecked, SplitIncoreOrch, IncoreTileOps, HasMemRefs, TileOps2D | AllocatedMemoryAddr | — |
 
@@ -254,7 +254,7 @@ class PassPipeline {
 3. 出错时抛出 `VerificationError`
 4. 跟踪已验证属性以避免重复检查
 
-**使用默认策略时**：
+**使用 `Default` 策略时**：
 
 | Pass 执行后 | 验证的属性 | 累计 |
 | ----------- | ---------- | ---- |
@@ -312,9 +312,9 @@ with passes.PassContext([passes.VerificationInstrument(passes.VerificationMode.A
     result = pm.run_passes(program)
 ```
 
-### Default 策略补充说明
+### 策略补充说明
 
-Default 策略中，InCore 后半段流水线顺序为：
+`Default` 和 `DebugTileOptimization` 共享的 PTO tile 阶段顺序为：
 
 1. `FlattenTileNdTo2D`
 2. `InferTileMemorySpace`
@@ -322,8 +322,13 @@ Default 策略中，InCore 后半段流水线顺序为：
 4. `ResolveBackendOpLayouts`
 5. `ExpandMixedKernel`
 6. `InitMemRef`
-7. `BasicMemoryReuse`
-8. `AllocateMemoryAddr`
+7. `MemoryReuse`
+8. `LegalizePTOBufferReuse`
+9. `AllocateMemoryAddr`
+
+`DebugTileOptimization` 只是用于排查 PTO tile 阶段的调试策略，会跳过
+tensor-only 前缀 pass。正常编译和非 strategy 专项测试都应优先使用
+`Default`，以保证主维护流水线持续被覆盖。
 
 `ResolveBackendOpLayouts` 会根据 backend 注册的 layout 元数据修复受约束
 的逐元素 tile 操作。对于当前 PTO 上要求 `row_major` 的逐元素算子，它会
@@ -339,7 +344,7 @@ from pypto.pypto_core import passes
 pipeline = passes.PassPipeline()
 pipeline.add_pass(passes.convert_to_ssa())
 pipeline.add_pass(passes.init_mem_ref())
-pipeline.add_pass(passes.basic_memory_reuse())
+pipeline.add_pass(passes.memory_reuse())
 
 # Execute
 result = pipeline.run(program)

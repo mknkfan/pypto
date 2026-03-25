@@ -108,6 +108,14 @@ class PTOCodegen : public CodegenBase {
   std::string GetIndexConstant(int64_t val);
 
   /**
+   * @brief Get or emit i32 constant (for cross-core consumer buffer addresses)
+   *
+   * @param value Constant value
+   * @return SSA variable name for the constant (e.g., "%c0_i32")
+   */
+  std::string GetOrEmitI32Constant(int32_t value);
+
+  /**
    * @brief Register a variable to an MLIR SSA name
    *
    * @param var IR variable
@@ -202,6 +210,44 @@ class PTOCodegen : public CodegenBase {
    */
   void SetCurrentResultBuf(const std::string& buf);
   void RegisterTileBufType(const std::string& ssa_name, const std::string& type_string);
+  std::string GetSSATileBufType(const std::string& ssa_name) const;
+
+  /**
+   * @brief Record the SSA name produced by reserve_buffer for cross-core pipe setup
+   */
+  void RecordReserveBufferSSA(const std::string& ssa);
+
+  /**
+   * @brief Get the recorded reserve_buffer SSA name (empty if none)
+   */
+  [[nodiscard]] std::string GetReserveBufferSSA() const;
+
+  /**
+   * @brief Record the SSA name produced by import_reserved_buffer for cross-core pipe setup
+   */
+  void RecordImportBufferSSA(const std::string& ssa);
+
+  /**
+   * @brief Get the recorded import_reserved_buffer SSA name (empty if none)
+   */
+  [[nodiscard]] std::string GetImportBufferSSA() const;
+
+  /**
+   * @brief Get the split value for a tile var produced by a tpop operation
+   * @param var Raw pointer to the tile variable
+   * @return Split value from the originating tpop (0 if not found)
+   */
+  [[nodiscard]] int GetTpopSplit(const ir::Var* var) const;
+
+  /**
+   * @brief Check if the current function is an AIC (Cube) function
+   */
+  [[nodiscard]] bool IsAICFunction() const;
+
+  /**
+   * @brief Check if the current function is an AIV (Vector) function
+   */
+  [[nodiscard]] bool IsAIVFunction() const;
 
  protected:
   // Override visitor methods for code generation - Statements
@@ -258,6 +304,14 @@ class PTOCodegen : public CodegenBase {
   void GenerateFunction(const ir::FunctionPtr& func);
 
   /**
+   * @brief Reorder top-level statements so each tpop chain follows pop-use-free order
+   *
+   * Hardware requires: tpop(tile) → use(tile) → tfree(tile) before the next tpop.
+   * Groups tpop assignment, its direct users, and its tfree into sequential chains.
+   */
+  std::vector<ir::StmtPtr> ReorderTpopChains(const std::vector<ir::StmtPtr>& stmts) const;
+
+  /**
    * @brief Build variable identity to MemRef mapping from function body
    */
   void BuildVarToMemRefMapping(const ir::FunctionPtr& func);
@@ -276,9 +330,9 @@ class PTOCodegen : public CodegenBase {
   void EmitMakeTensorViews(const ir::FunctionPtr& func);
 
   /**
-   * @brief Emit alloc_tile for all MemRefs
+   * @brief Emit alloc_tile for a tile variable before its first use
    */
-  void EmitAllocTiles(const ir::FunctionPtr& func, const std::vector<ir::MemRefPtr>& memrefs);
+  void EmitAllocTileForVar(const ir::VarPtr& tile_var, const std::shared_ptr<const ir::TileType>& tile_type);
 
   /**
    * @brief Emit alloc_tile for dynamically allocated tile buffers (e.g., reshape outputs)
@@ -296,6 +350,11 @@ class PTOCodegen : public CodegenBase {
   std::string GetOrEmitIndexConstant(int64_t value);
 
   /**
+   * @brief Get or emit i64 constant (for tile buffer addresses)
+   */
+  std::string GetOrEmitI64Constant(int64_t value);
+
+  /**
    * @brief Get tile_buf name for a MemRef
    */
   std::string GetTileBufForMemRef(const ir::MemRefPtr& memref);
@@ -311,21 +370,32 @@ class PTOCodegen : public CodegenBase {
   std::map<const ir::Var*, std::string> tensor_to_view_;
   std::map<const ir::MemRef*, std::string> memref_to_mlir_;
   std::map<const ir::Var*, const ir::MemRef*> var_to_memref_;
+  /// Root alloc TileType per MemRef (first writer's type, used for pto.alloc_tile)
   std::map<const ir::MemRef*, std::shared_ptr<const ir::TileType>> memref_to_tile_type_;
   std::map<int64_t, std::string> emitted_constants_;
+  std::map<int64_t, std::string> emitted_i64_constants_;
+  std::map<int32_t, std::string> emitted_i32_constants_;
   std::set<double> emitted_float_constants_;
   std::map<double, std::string> float_const_names_;
 
   /// Dynamically allocated tile buffers (SSA name, type string) emitted at function scope
   std::vector<std::pair<std::string, std::string>> extra_alloc_tiles_;
-  /// Maps extra tile buffer SSA names to their type strings (for correct type annotations)
-  std::map<std::string, std::string> extra_tile_buf_types_;
+  /// Unified SSA → tile_buf type mapping.  Every typed tile SSA value
+  /// (root alloc, reshape result, fillpad result, etc.) has an entry here.
+  /// GetExprTypeAnnotation uses this as the primary lookup.
+  std::map<std::string, std::string> ssa_to_tile_buf_type_;
 
   int temp_counter_ = 0;
   std::set<std::string> used_ssa_names_;
 
   /// Maps each unique MemRef to the first IR variable name assigned to it (program order)
   std::map<const ir::MemRef*, std::string> memref_to_var_name_;
+
+  /// Ordered tile variable allocations: (VarPtr, TileType) pairs in program order.
+  /// This is the single source of truth for per-variable alloc_tile emission.
+  std::vector<std::pair<ir::VarPtr, std::shared_ptr<const ir::TileType>>> tile_var_allocs_;
+  std::set<const ir::Var*> emitted_tile_alloc_vars_;
+  std::map<const ir::Var*, int> tpop_result_vars_;  ///< Tile vars from tpop: var -> split value
 
   // Current function context
   ir::FunctionPtr current_function_;
@@ -334,6 +404,14 @@ class PTOCodegen : public CodegenBase {
   std::shared_ptr<const ir::TileType> current_result_tile_type_;
 
   const backend::Backend* backend_;  ///< Backend instance for querying op info
+
+  // Cross-core buffer SSA tracking (per function)
+  // NOTE: These are singletons because the cross-core protocol guarantees at most
+  // one reserve_buffer and one import_peer_buffer per function.  If the protocol
+  // evolves to support multiple buffers per direction, these should be replaced
+  // with a map keyed by buffer name or direction.
+  std::string reserve_buf_ssa_;  ///< SSA name from reserve_buffer
+  std::string import_buf_ssa_;   ///< SSA name from import_reserved_buffer
 
   // Control flow expression result communication
   std::string current_expr_value_;         ///< SSA name from expression visitors
