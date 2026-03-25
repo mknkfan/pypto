@@ -85,6 +85,34 @@ T GetKwargOr(const std::vector<std::pair<std::string, std::any>>& kwargs, const 
   return default_value;
 }
 
+// Load a matmul operand into Mat space if it's a TensorType.
+// If already a TileType, returns the operand as-is.
+ExprPtr LoadOperandToMat(const ExprPtr& operand, bool transpose, const std::string& var_name,
+                         std::vector<StmtPtr>& prologue, const Span& span) {
+  auto& op_reg = OpRegistry::GetInstance();
+  auto tensor_type = As<TensorType>(operand->GetType());
+  if (tensor_type) {
+    auto offsets = MakeZeroOffsetsTuple(tensor_type->shape_.size(), span);
+    auto shape = tensor_type->shape_;
+    if (transpose && shape.size() == 2) {
+      std::swap(shape[0], shape[1]);
+    }
+    auto shapes = MakeShapesTuple(shape, span);
+    std::vector<std::pair<std::string, std::any>> kw = {{"target_memory", MemorySpace::Mat},
+                                                        {"transpose", transpose}};
+    auto load = op_reg.Create("tile.load", {operand, offsets, shapes, shapes}, kw, span);
+    auto load_var = std::make_shared<Var>(var_name, load->GetType(), span);
+    prologue.push_back(std::make_shared<AssignStmt>(load_var, load, span));
+    return load_var;
+  }
+  auto tile_type = As<TileType>(operand->GetType());
+  if (tile_type) {
+    return operand;
+  }
+  INTERNAL_CHECK(false) << "LoadOperandToMat: unexpected type: " << operand->GetType()->TypeName();
+  return nullptr;  // unreachable
+}
+
 }  // namespace
 
 OpConversionRegistry& OpConversionRegistry::GetInstance() {
@@ -216,64 +244,42 @@ OpConversionRegistry::OpConversionRegistry() {
       [](const std::vector<ExprPtr>& args, const std::vector<std::pair<std::string, std::any>>& kwargs,
          const Span& span) -> ConversionResult {
         CHECK(args.size() == 2) << "tensor.matmul conversion expects 2 args (lhs, rhs)";
-        auto& op_reg = OpRegistry::GetInstance();
 
         bool a_trans = GetKwargOr<bool>(kwargs, "a_trans", false);
         bool b_trans = GetKwargOr<bool>(kwargs, "b_trans", false);
 
-        const auto& lhs = args[0];
-        const auto& rhs = args[1];
+        std::vector<StmtPtr> prologue;
+        auto lhs_mat = LoadOperandToMat(args[0], a_trans, "lhs_mat", prologue, span);
+        auto rhs_mat = LoadOperandToMat(args[1], b_trans, "rhs_mat", prologue, span);
+
+        auto matmul_call = OpRegistry::GetInstance().Create("tile.matmul", {lhs_mat, rhs_mat}, span);
+        return ConversionResult{std::move(prologue), matmul_call};
+      });
+
+  // ────────────────────────────────────────────────────────────────────────
+  // tensor.matmul_acc → tile.matmul_acc
+  //
+  // tensor.matmul_acc(acc, lhs, rhs, a_trans=False, b_trans=False)
+  // acc is passed through (already TileType from IterArg type propagation).
+  // lhs/rhs are loaded into Mat space (same as tensor.matmul).
+  // ────────────────────────────────────────────────────────────────────────
+
+  RegisterCustom(
+      "tensor.matmul_acc",
+      [](const std::vector<ExprPtr>& args, const std::vector<std::pair<std::string, std::any>>& kwargs,
+         const Span& span) -> ConversionResult {
+        CHECK(args.size() == 3) << "tensor.matmul_acc conversion expects 3 args (acc, lhs, rhs)";
+
+        bool a_trans = GetKwargOr<bool>(kwargs, "a_trans", false);
+        bool b_trans = GetKwargOr<bool>(kwargs, "b_trans", false);
 
         std::vector<StmtPtr> prologue;
+        auto lhs_mat = LoadOperandToMat(args[1], a_trans, "lhs_mat", prologue, span);
+        auto rhs_mat = LoadOperandToMat(args[2], b_trans, "rhs_mat", prologue, span);
 
-        auto lhs_tile_type = As<TileType>(lhs->GetType());
-        auto rhs_tile_type = As<TileType>(rhs->GetType());
-        auto lhs_tensor_type = As<TensorType>(lhs->GetType());
-        auto rhs_tensor_type = As<TensorType>(rhs->GetType());
-
-        ExprPtr lhs_mat, rhs_mat;
-
-        if (lhs_tensor_type) {
-          auto offsets = MakeZeroOffsetsTuple(lhs_tensor_type->shape_.size(), span);
-          auto lhs_shape = lhs_tensor_type->shape_;
-          if (a_trans && lhs_shape.size() == 2) {
-            std::swap(lhs_shape[0], lhs_shape[1]);
-          }
-          auto shapes = MakeShapesTuple(lhs_shape, span);
-          std::vector<std::pair<std::string, std::any>> kw = {{"target_memory", MemorySpace::Mat},
-                                                              {"transpose", a_trans}};
-          auto load = op_reg.Create("tile.load", {lhs, offsets, shapes, shapes}, kw, span);
-          auto load_var = std::make_shared<Var>("lhs_mat", load->GetType(), span);
-          prologue.push_back(std::make_shared<AssignStmt>(load_var, load, span));
-          lhs_mat = load_var;
-        } else if (lhs_tile_type) {
-          lhs_mat = lhs;
-        } else {
-          CHECK(false) << "tensor.matmul: unexpected lhs type: " << lhs->GetType()->TypeName();
-        }
-
-        if (rhs_tensor_type) {
-          auto offsets = MakeZeroOffsetsTuple(rhs_tensor_type->shape_.size(), span);
-          auto rhs_shape = rhs_tensor_type->shape_;
-          if (b_trans && rhs_shape.size() == 2) {
-            std::swap(rhs_shape[0], rhs_shape[1]);
-          }
-          auto shapes = MakeShapesTuple(rhs_shape, span);
-          std::vector<std::pair<std::string, std::any>> kw = {{"target_memory", MemorySpace::Mat},
-                                                              {"transpose", b_trans}};
-          auto load = op_reg.Create("tile.load", {rhs, offsets, shapes, shapes}, kw, span);
-          auto load_var = std::make_shared<Var>("rhs_mat", load->GetType(), span);
-          prologue.push_back(std::make_shared<AssignStmt>(load_var, load, span));
-          rhs_mat = load_var;
-        } else if (rhs_tile_type) {
-          rhs_mat = rhs;
-        } else {
-          CHECK(false) << "tensor.matmul: unexpected rhs type: " << rhs->GetType()->TypeName();
-        }
-
-        // tile.move insertion is now handled by InferTileMemorySpace pass
-        auto matmul_call = op_reg.Create("tile.matmul", {lhs_mat, rhs_mat}, span);
-        return ConversionResult{std::move(prologue), matmul_call};
+        auto matmul_acc_call =
+            OpRegistry::GetInstance().Create("tile.matmul_acc", {args[0], lhs_mat, rhs_mat}, span);
+        return ConversionResult{std::move(prologue), matmul_acc_call};
       });
 
   // ────────────────────────────────────────────────────────────────────────
@@ -427,6 +433,71 @@ OpConversionRegistry::OpConversionRegistry() {
           return ConversionResult{op_reg.Create("tensor.assemble", args, span)};
         }
         return ConversionResult{op_reg.Create("tensor.assemble", args, kwargs, span)};
+      });
+
+  // ────────────────────────────────────────────────────────────────────────
+  // tensor.scatter_update → tile.scatter_update
+  //
+  // When input is a TileType (local buffer created via tensor.create), load
+  // index and src if needed, then emit tile.scatter_update(input, index, src).
+  // When input is a TensorType (global memory, e.g. KV cache pool), keep the
+  // op unchanged — the orchestration codegen handles it via memcpy.
+  // ────────────────────────────────────────────────────────────────────────
+
+  RegisterCustom(
+      "tensor.scatter_update",
+      [](const std::vector<ExprPtr>& args, const std::vector<std::pair<std::string, std::any>>& kwargs,
+         const Span& span) -> ConversionResult {
+        CHECK(args.size() == 3) << "tensor.scatter_update conversion expects 3 args (input, index, src)";
+        auto& op_reg = OpRegistry::GetInstance();
+
+        const auto& input = args[0];
+        const auto& index = args[1];
+        const auto& src = args[2];
+
+        auto input_tensor_type = As<TensorType>(input->GetType());
+
+        if (input_tensor_type) {
+          // Global tensor input — keep as tensor.scatter_update (handled by orchestration codegen)
+          if (kwargs.empty()) {
+            return ConversionResult{op_reg.Create("tensor.scatter_update", args, span)};
+          }
+          return ConversionResult{op_reg.Create("tensor.scatter_update", args, kwargs, span)};
+        }
+
+        CHECK(As<TileType>(input->GetType()))
+            << "tensor.scatter_update: unexpected input type: " << input->GetType()->TypeName();
+
+        std::vector<StmtPtr> prologue;
+
+        // Load index to Vec tile if it is still a global tensor
+        ExprPtr index_tile = index;
+        if (auto index_tensor_type = As<TensorType>(index->GetType())) {
+          auto offsets = MakeZeroOffsetsTuple(index_tensor_type->shape_.size(), span);
+          auto shapes = MakeShapesTuple(index_tensor_type->shape_, span);
+          std::vector<std::pair<std::string, std::any>> load_kw = {{"target_memory", MemorySpace::Vec},
+                                                                   {"transpose", false}};
+          auto load = op_reg.Create("tile.load", {index, offsets, shapes, shapes}, load_kw, span);
+          auto idx_var = std::make_shared<Var>("scatter_idx", load->GetType(), span);
+          prologue.push_back(std::make_shared<AssignStmt>(idx_var, load, span));
+          index_tile = idx_var;
+        }
+
+        // Load src to Vec tile if it is still a global tensor
+        ExprPtr src_tile = src;
+        if (auto src_tensor_type = As<TensorType>(src->GetType())) {
+          auto offsets = MakeZeroOffsetsTuple(src_tensor_type->shape_.size(), span);
+          auto shapes = MakeShapesTuple(src_tensor_type->shape_, span);
+          std::vector<std::pair<std::string, std::any>> load_kw = {{"target_memory", MemorySpace::Vec},
+                                                                   {"transpose", false}};
+          auto load = op_reg.Create("tile.load", {src, offsets, shapes, shapes}, load_kw, span);
+          auto src_var = std::make_shared<Var>("scatter_src", load->GetType(), span);
+          prologue.push_back(std::make_shared<AssignStmt>(src_var, load, span));
+          src_tile = src_var;
+        }
+
+        auto scatter_call = op_reg.Create("tile.scatter_update", {input, index_tile, src_tile}, kwargs, span);
+        return ConversionResult{std::move(prologue), scatter_call};
       });
 
   // ────────────────────────────────────────────────────────────────────────

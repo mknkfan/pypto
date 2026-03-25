@@ -650,6 +650,39 @@ class TestConvertTensorToTileOps:
         After = passes.convert_tensor_to_tile_ops()(Before)
         ir.assert_structural_equal(After, Expected)
 
+    def test_matmul_acc_conversion(self):
+        """tensor.matmul + tensor.matmul_acc -> tile.matmul + tile.matmul_acc.
+
+        Verifies that tensor.matmul_acc is converted to tile.matmul_acc,
+        with lhs/rhs loaded to Mat space and acc passed through from matmul result.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                lhs: pl.Tensor[[16, 128], pl.FP32],
+                rhs: pl.Tensor[[128, 64], pl.FP32],
+            ) -> pl.Tensor[[16, 64], pl.FP32]:
+                acc: pl.Tensor[[16, 64], pl.FP32] = pl.matmul(lhs, rhs)
+                result: pl.Tensor[[16, 64], pl.FP32] = pl.matmul_acc(acc, lhs, rhs)
+                return result
+
+            @pl.function
+            def main(
+                self,
+                lhs: pl.Tensor[[16, 128], pl.FP32],
+                rhs: pl.Tensor[[128, 64], pl.FP32],
+            ) -> pl.Tensor[[16, 64], pl.FP32]:
+                result: pl.Tensor[[16, 64], pl.FP32] = self.main_incore_0(lhs, rhs)
+                return result
+
+        After = passes.convert_tensor_to_tile_ops()(Before)
+        ir_str = str(After)
+        assert "tile.matmul_acc" in ir_str
+        assert "tile.matmul" in ir_str
+
     def test_assemble_tile_tile_then_cast_conversion(self):
         """tensor.create + tensor.assemble(tile,tile) + tensor.cast must not crash.
 
@@ -1510,6 +1543,67 @@ class TestNestedControlFlow:
         with pytest.raises(Exception, match="has no registered tile conversion"):
             passes.convert_tensor_to_tile_ops()(prog)
 
+    def test_iter_arg_init_from_tensor_param_gets_preloaded(self):
+        """Tensor parameter used only as ForStmt iter_arg initValue must be pre-loaded.
+
+        Regression test: when a TensorType function parameter is used exclusively as
+        the init value of a ForStmt iter_arg (not as a direct argument to any converted
+        op), Phase 1 must still insert a tile.load for it. Otherwise the iter_arg stays
+        TensorType and later tile ops (e.g. tile.add) fail type-checking.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                acc: pl.Tensor[[64], pl.FP32],
+                x: pl.Tensor[[64], pl.FP32],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                for i, (running_sum,) in pl.range(3, init_values=(acc,)):
+                    new_sum: pl.Tensor[[64], pl.FP32] = pl.add(running_sum, x)
+                    result = pl.yield_(new_sum)
+                return result
+
+            @pl.function
+            def main(
+                self,
+                acc: pl.Tensor[[64], pl.FP32],
+                x: pl.Tensor[[64], pl.FP32],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                result: pl.Tensor[[64], pl.FP32] = self.main_incore_0(acc, x)
+                return result
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                acc: pl.Tensor[[64], pl.FP32],
+                x: pl.Tensor[[64], pl.FP32],
+                out_0: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                acc_tile: pl.Tile[[64], pl.FP32] = pl.load(acc, [0], [64])
+                x_tile: pl.Tile[[64], pl.FP32] = pl.load(x, [0], [64])
+                for i, (running_sum,) in pl.range(3, init_values=(acc_tile,)):
+                    new_sum_tile: pl.Tile[[64], pl.FP32] = pl.tile.add(running_sum, x_tile)
+                    result = pl.yield_(new_sum_tile)
+                out_0_store: pl.Tensor[[64], pl.FP32] = pl.store(result, [0], out_0)
+                return out_0_store
+
+            @pl.function
+            def main(
+                self,
+                acc: pl.Tensor[[64], pl.FP32],
+                x: pl.Tensor[[64], pl.FP32],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                out_0: pl.Tensor[[64], pl.FP32] = pl.create_tensor([64], dtype=pl.FP32)
+                result: pl.Tensor[[64], pl.FP32] = self.main_incore_0(acc, x, out_0)
+                return result
+
+        After = passes.convert_tensor_to_tile_ops()(Before)
+        ir.assert_structural_equal(After, Expected)
+
 
 class TestGmLocalTensorConversion:
     """Test gm_tensor vs local_tensor differentiated conversion."""
@@ -2166,6 +2260,70 @@ class TestSliceMatmulConversion:
 
         After = passes.convert_tensor_to_tile_ops()(Before)
         ir.assert_structural_equal(After, Expected)
+
+
+class TestScatterUpdateConversion:
+    """Tests for tensor.scatter_update → tile.scatter_update conversion."""
+
+    def test_scatter_update_local_tile_converts(self):
+        """tensor.scatter_update on a local tile buffer converts to tile.scatter_update."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                index: pl.Tensor[[2, 4], pl.INT32],
+                src: pl.Tensor[[8, 64], pl.FP16],
+            ) -> pl.Tensor[[16, 64], pl.FP16]:
+                buf: pl.Tensor[[16, 64], pl.FP16] = pl.create_tensor([16, 64], dtype=pl.FP16)
+                result: pl.Tensor[[16, 64], pl.FP16] = pl.scatter_update(buf, -2, index, src)
+                return result
+
+            @pl.function
+            def main(
+                self,
+                index: pl.Tensor[[2, 4], pl.INT32],
+                src: pl.Tensor[[8, 64], pl.FP16],
+            ) -> pl.Tensor[[16, 64], pl.FP16]:
+                result: pl.Tensor[[16, 64], pl.FP16] = self.main_incore_0(index, src)
+                return result
+
+        After = passes.convert_tensor_to_tile_ops()(Before)
+        after_str = str(After)
+        assert "tile.scatter_update" in after_str
+        assert "tensor.scatter_update" not in after_str
+
+    def test_scatter_update_global_tensor_stays(self):
+        """tensor.scatter_update on a global tensor also converts to tile.scatter_update
+        because the pass first loads all function-parameter tensors into tiles."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                kv_cache: pl.Tensor[[16, 64], pl.FP16],
+                index: pl.Tensor[[2, 4], pl.INT32],
+                src: pl.Tensor[[8, 64], pl.FP16],
+            ) -> pl.Tensor[[16, 64], pl.FP16]:
+                result: pl.Tensor[[16, 64], pl.FP16] = pl.scatter_update(kv_cache, -2, index, src)
+                return result
+
+            @pl.function
+            def main(
+                self,
+                kv_cache: pl.Tensor[[16, 64], pl.FP16],
+                index: pl.Tensor[[2, 4], pl.INT32],
+                src: pl.Tensor[[8, 64], pl.FP16],
+            ) -> pl.Tensor[[16, 64], pl.FP16]:
+                result: pl.Tensor[[16, 64], pl.FP16] = self.main_incore_0(kv_cache, index, src)
+                return result
+
+        After = passes.convert_tensor_to_tile_ops()(Before)
+        after_str = str(After)
+        # The pass loads all tensor parameters to tiles, so scatter_update becomes tile.scatter_update
+        assert "tile.scatter_update" in after_str
 
 
 if __name__ == "__main__":

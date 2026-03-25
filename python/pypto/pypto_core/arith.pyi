@@ -10,10 +10,26 @@
 """Type stubs for the arith submodule (arithmetic simplification utilities)."""
 
 from collections.abc import Callable
+from enum import IntFlag
 from types import TracebackType
 from typing import ClassVar, overload
 
 from pypto.pypto_core.ir import Expr, Var
+
+class CompareResult(IntFlag):
+    """Result of comparing two expressions.
+
+    Uses bitwise encoding: bit0=EQ, bit1=LT, bit2=GT.
+    """
+
+    kInconsistent = 0
+    kEQ = 1
+    kLT = 2
+    kLE = 3
+    kGT = 4
+    kGE = 5
+    kNE = 6
+    kUnknown = 7
 
 def fold_const(expr: Expr) -> Expr | None:
     """Try to constant-fold an expression."""
@@ -138,6 +154,10 @@ class ConstIntBoundAnalyzer:
         """Update a variable's bound (inclusive on both ends)."""
         ...
 
+    def unbind(self, var: Var) -> None:
+        """Remove a variable's binding, restoring it to the default (everything) state."""
+        ...
+
 class ModularSet:
     """Modular arithmetic properties: value = coeff * k + base."""
 
@@ -171,8 +191,42 @@ class ModularSetAnalyzer:
         """Update a variable's modular set information."""
         ...
 
+    def unbind(self, var: Var) -> None:
+        """Remove a variable's modular set information, restoring it to the default (everything) state."""
+        ...
+
     def enter_constraint(self, constraint: Expr) -> Callable[[], None] | None:
         """Enter a constraint scope. Returns a recovery function, or None."""
+        ...
+
+class TransitiveComparisonAnalyzer:
+    """Derives transitive comparison results from known inequalities.
+
+    Given known comparisons like x < y and y < z, can derive x < z.
+    """
+
+    def __init__(self) -> None:
+        """Create a standalone TransitiveComparisonAnalyzer."""
+        ...
+
+    def try_compare(self, lhs: Expr, rhs: Expr, propagate_inequalities: bool = True) -> CompareResult:
+        """Compare two expressions using known comparisons and transitive propagation."""
+        ...
+
+    @overload
+    def bind(self, var: Var, expr: Expr, allow_override: bool = False) -> None: ...
+    @overload
+    def bind(self, var: Var, min_val: int, max_val_exclusive: int, allow_override: bool = False) -> None: ...
+    def bind(self, var: Var, *args, **kwargs) -> None:
+        """Bind a variable to an expression or half-open range [min_val, max_val_exclusive)."""
+        ...
+
+    def unbind(self, var: Var) -> None:
+        """Remove all known comparisons involving a variable."""
+        ...
+
+    def enter_constraint(self, constraint: Expr) -> Callable[[], None]:
+        """Enter a constraint scope. Returns a recovery function that restores original state."""
         ...
 
 class Analyzer:
@@ -185,6 +239,7 @@ class Analyzer:
     const_int_bound: ConstIntBoundAnalyzer
     modular_set: ModularSetAnalyzer
     rewrite_simplify: RewriteSimplifier
+    transitive_cmp: TransitiveComparisonAnalyzer
 
     @overload
     def bind(self, var: Var, expr: Expr, allow_override: bool = False) -> None: ...
@@ -192,6 +247,10 @@ class Analyzer:
     def bind(self, var: Var, min_val: int, max_val_exclusive: int, allow_override: bool = False) -> None: ...
     def bind(self, var: Var, *args, **kwargs) -> None:
         """Bind a variable to an expression or half-open range [min_val, max_val_exclusive)."""
+        ...
+
+    def unbind(self, var: Var) -> None:
+        """Remove a variable's binding from all sub-analyzers, restoring it to an unbound state."""
         ...
 
     def simplify(self, expr: Expr, steps: int = 2) -> Expr:

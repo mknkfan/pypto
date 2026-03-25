@@ -68,8 +68,8 @@ class PTOCodegen : public CodegenBase {
   void Emit(const std::string& line) override;
   std::string GetExprAsCode(const ir::ExprPtr& expr) override;
   [[nodiscard]] std::string GetTypeString(const DataType& dtype) const override;
-  int64_t GetConstIntValue(const ir::ExprPtr& expr) override;
-  std::string GetVarName(const ir::VarPtr& var) override;
+  int64_t GetConstIntValue(const ir::ExprPtr& expr) const override;
+  std::string GetVarName(const ir::VarPtr& var) const override;
 
   // PTO-specific helper methods for operator codegen functions
 
@@ -114,6 +114,21 @@ class PTOCodegen : public CodegenBase {
    * @return SSA variable name for the constant (e.g., "%c0_i32")
    */
   std::string GetOrEmitI32Constant(int32_t value);
+
+  /**
+   * @brief Emit arith.index_cast if var is not already index type
+   *
+   * Valid_shape vars may be INT64/INT32 (from pl.min(...)), but pto.alloc_tile
+   * and pto.set_validshape need index type operands.
+   *
+   * @param var IR variable to cast
+   * @param mlir_name Current MLIR SSA name for the variable
+   * @return SSA name of the index-typed value (original if already index)
+   */
+  std::string EmitCastToIndex(const ir::VarPtr& var, const std::string& mlir_name);
+
+  /// Check if a tile variable is consumed by a tile.fillpad operation.
+  bool HasFillpadConsumer(const ir::Var* var) const;
 
   /**
    * @brief Register a variable to an MLIR SSA name
@@ -187,7 +202,8 @@ class PTOCodegen : public CodegenBase {
    * Needed when multiple variables with different shapes share the same MemRef
    * (e.g., reshape input/output).
    */
-  std::string GetTileBufTypeStringFromTileType(const std::shared_ptr<const ir::TileType>& tile_type) const;
+  std::string GetTileBufTypeStringFromTileType(const std::shared_ptr<const ir::TileType>& tile_type,
+                                               bool force_all_dynamic = false) const;
 
   /**
    * @brief Allocate a new tile buffer for codegen (emitted at function scope)
@@ -196,9 +212,15 @@ class PTOCodegen : public CodegenBase {
    * input and output would otherwise share the same buffer).
    *
    * @param tile_buf_type_string The tile_buf type string for the alloc_tile instruction
+   * @param name_hint Preferred SSA name seed
+   * @param addr_ssa Optional SSA value for the alloc_tile addr operand
+   * @param valid_row_ssa Optional SSA value for the alloc_tile valid_row operand
+   * @param valid_col_ssa Optional SSA value for the alloc_tile valid_col operand
    * @return New SSA variable name for the allocated buffer
    */
-  std::string AllocNewTileBuf(const std::string& tile_buf_type_string, const std::string& name_hint = "");
+  std::string AllocNewTileBuf(const std::string& tile_buf_type_string, const std::string& name_hint = "",
+                              const std::string& addr_ssa = "", const std::string& valid_row_ssa = "",
+                              const std::string& valid_col_ssa = "");
 
   /**
    * @brief Override the current result buffer name
@@ -233,11 +255,14 @@ class PTOCodegen : public CodegenBase {
   [[nodiscard]] std::string GetImportBufferSSA() const;
 
   /**
-   * @brief Get the split value for a tile var produced by a tpop operation
+   * @brief Get the split value for a tile var produced by a matching tpop operation
    * @param var Raw pointer to the tile variable
-   * @return Split value from the originating tpop (0 if not found)
+   * @param expected_tpop_op_name Expected originating tpop op name
+   * @param tfree_op_name Name of the consuming tfree op for diagnostics
+   * @return Split value from the originating tpop
    */
-  [[nodiscard]] int GetTpopSplit(const ir::Var* var) const;
+  [[nodiscard]] int GetValidatedTpopSplit(const ir::Var* var, const std::string& expected_tpop_op_name,
+                                          const std::string& tfree_op_name) const;
 
   /**
    * @brief Check if the current function is an AIC (Cube) function
@@ -357,7 +382,7 @@ class PTOCodegen : public CodegenBase {
   /**
    * @brief Get tile_buf name for a MemRef
    */
-  std::string GetTileBufForMemRef(const ir::MemRefPtr& memref);
+  std::string GetTileBufForMemRef(const ir::MemRefPtr& memref) const;
 
   // Output streams
   std::ostringstream stream_;
@@ -378,8 +403,16 @@ class PTOCodegen : public CodegenBase {
   std::set<double> emitted_float_constants_;
   std::map<double, std::string> float_const_names_;
 
-  /// Dynamically allocated tile buffers (SSA name, type string) emitted at function scope
-  std::vector<std::pair<std::string, std::string>> extra_alloc_tiles_;
+  struct ExtraAllocTile {
+    std::string name;
+    std::string type_string;
+    std::string addr_ssa;
+    std::string valid_row_ssa;
+    std::string valid_col_ssa;
+  };
+
+  /// Dynamically allocated tile buffers emitted at function scope
+  std::vector<ExtraAllocTile> extra_alloc_tiles_;
   /// Unified SSA → tile_buf type mapping.  Every typed tile SSA value
   /// (root alloc, reshape result, fillpad result, etc.) has an entry here.
   /// GetExprTypeAnnotation uses this as the primary lookup.
@@ -395,7 +428,13 @@ class PTOCodegen : public CodegenBase {
   /// This is the single source of truth for per-variable alloc_tile emission.
   std::vector<std::pair<ir::VarPtr, std::shared_ptr<const ir::TileType>>> tile_var_allocs_;
   std::set<const ir::Var*> emitted_tile_alloc_vars_;
-  std::map<const ir::Var*, int> tpop_result_vars_;  ///< Tile vars from tpop: var -> split value
+  struct TpopResultInfo {
+    int split = 0;
+    std::string op_name;
+  };
+  std::map<const ir::Var*, TpopResultInfo>
+      tpop_result_vars_;                         ///< Tile vars from tpop: var -> split + op name
+  std::set<const ir::Var*> fillpad_input_vars_;  ///< Tile vars consumed by tile.fillpad
 
   // Current function context
   ir::FunctionPtr current_function_;

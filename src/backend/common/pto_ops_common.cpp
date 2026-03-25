@@ -367,6 +367,46 @@ static std::string MakeTileLoadCodegenPTO(const CallPtr& op, codegen::CodegenBas
   tload_line << "pto.tload ins(" << partition_view << " : " << partition_type << ") outs(";
   tload_line << tile_buf << " : " << tile_buf_type << ")";
   codegen.Emit(tload_line.str());
+
+  // Emit pto.set_validshape after tload only when a fillpad consumer exists.
+  // Physical dims were used for alloc_tile (correct DMA stride); set_validshape
+  // sets the actual valid region before fillpad pads the rest.
+  auto result_var = codegen.GetCurrentResultVar();
+  if (result_var) {
+    auto tile_type = ir::As<ir::TileType>(result_var->GetType());
+    if (tile_type && tile_type->tile_view_.has_value() && codegen.HasFillpadConsumer(result_var.get())) {
+      const auto& tv = tile_type->tile_view_.value();
+      bool has_dynamic = false;
+      std::string vr, vc;
+
+      // Extract valid_row SSA
+      if (tv.valid_shape.size() >= 1) {
+        if (auto var = ir::As<ir::Var>(tv.valid_shape[0])) {
+          std::string mlir_name = codegen.GetVarName(var);
+          vr = codegen.EmitCastToIndex(var, mlir_name);
+          has_dynamic = true;
+        } else if (auto c = ir::As<ir::ConstInt>(tv.valid_shape[0])) {
+          vr = codegen.GetIndexConstant(c->value_);
+        }
+      }
+
+      // Extract valid_col SSA
+      if (tv.valid_shape.size() >= 2) {
+        if (auto var = ir::As<ir::Var>(tv.valid_shape[1])) {
+          std::string mlir_name = codegen.GetVarName(var);
+          vc = codegen.EmitCastToIndex(var, mlir_name);
+          has_dynamic = true;
+        } else if (auto c = ir::As<ir::ConstInt>(tv.valid_shape[1])) {
+          vc = codegen.GetIndexConstant(c->value_);
+        }
+      }
+
+      if (has_dynamic && !vr.empty() && !vc.empty()) {
+        codegen.Emit("pto.set_validshape " + tile_buf + ", " + vr + ", " + vc + " : " + tile_buf_type);
+      }
+    }
+  }
+
   return "";
 }
 
@@ -791,24 +831,18 @@ static std::string MakeTpopFromAivCodegenPTO(const CallPtr& op, codegen::Codegen
   return "";
 }
 
-/// tfree codegen for system.tfree_to_aic: emits pto.tfree(%tile : type) {split = N}
+/// tfree codegen for system.tfree_to_aic: emits pto.tfree_from_aic {split = N}
 static std::string MakeTfreeToAicCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
   auto& codegen = dynamic_cast<codegen::PTOCodegen&>(codegen_base);
 
-  CHECK(op->args_.size() == 1) << "tfree requires 1 argument (tile from tpop), got " << op->args_.size();
+  CHECK(op->args_.size() == 1) << "tfree_to_aic requires 1 argument (tile from tpop), got "
+                               << op->args_.size();
   auto tile = AsVarLike(op->args_[0]);
-  INTERNAL_CHECK(tile) << "tfree first argument must be a Var or IterArg";
-
-  std::string tile_buf = codegen.GetVarName(tile);
-  std::string tile_type = codegen.GetExprTypeAnnotation(op->args_[0]);
-  int split = codegen.GetTpopSplit(tile.get());
+  INTERNAL_CHECK(tile) << "tfree_to_aic first argument must be a Var or IterArg";
+  int split = codegen.GetValidatedTpopSplit(tile.get(), "tile.tpop_from_aic", "system.tfree_to_aic");
 
   std::ostringstream oss;
-  oss << "pto.tfree(" << tile_buf;
-  if (!tile_type.empty()) {
-    oss << " : " << tile_type;
-  }
-  oss << ") {split = " << split << "}";
+  oss << "pto.tfree_from_aic {split = " << split << "}";
   codegen.Emit(oss.str());
 
   return "";
@@ -823,7 +857,7 @@ static std::string MakeTfreeToAivCodegenPTO(const CallPtr& op, codegen::CodegenB
   auto tile = AsVarLike(op->args_[0]);
   INTERNAL_CHECK(tile) << "tfree_to_aiv first argument must be a Var or IterArg";
 
-  int split = codegen.GetTpopSplit(tile.get());
+  int split = codegen.GetValidatedTpopSplit(tile.get(), "tile.tpop_from_aiv", "system.tfree_to_aiv");
 
   std::ostringstream oss;
   oss << "pto.tfree_from_aiv {split = " << split << "}";
@@ -1146,9 +1180,11 @@ void RegisterPTOOps(Backend& backend, const std::unordered_set<std::string>& exc
 
     const auto name = op->GetKwarg<std::string>("name");
     const int size = op->GetKwarg<int>("size", -1);
-    const int base = op->GetKwarg<int>("base", -1);  // -1 = AUTO
+    const int base = op->GetKwarg<int>("base", -1);
     CHECK(!name.empty()) << "reserve_buffer requires 'name' attribute";
     CHECK(size > 0) << "reserve_buffer requires positive 'size' attribute, got " << size;
+    CHECK(base >= 0)
+        << "reserve_buffer requires AllocateMemoryAddr to resolve 'base' before PTO emission, got " << base;
     CheckSafeIdentifier(name, "reserve_buffer 'name'");
 
     std::string ssa_name = codegen.GetCurrentResultTarget();
@@ -1168,12 +1204,7 @@ void RegisterPTOOps(Backend& backend, const std::unordered_set<std::string>& exc
 
     std::ostringstream oss;
     oss << ssa_name << " = pto.reserve_buffer {name = \"" << name << "\", size = " << size
-        << ", location = #pto.address_space<" << location << ">";
-    if (base >= 0) {
-      oss << ", auto = false, base = " << base;
-    } else {
-      oss << ", auto = true";
-    }
+        << ", location = #pto.address_space<" << location << ">, auto = false, base = " << base;
     oss << "} -> i32";
     codegen.Emit(oss.str());
     codegen.RecordReserveBufferSSA(ssa_name);

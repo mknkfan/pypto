@@ -204,6 +204,32 @@ def matmul(
     return _ir_core.create_op_call("tensor.matmul", args, kwargs, actual_span)
 
 
+def matmul_acc(
+    acc: Expr,
+    lhs: Expr,
+    rhs: Expr,
+    a_trans: bool = False,
+    b_trans: bool = False,
+    span: Span | None = None,
+) -> Call:
+    """Matrix multiplication with accumulation: acc = acc + lhs @ rhs.
+
+    Args:
+        acc: Accumulator tensor
+        lhs: Left-hand side tensor
+        rhs: Right-hand side tensor
+        a_trans: Whether to transpose lhs
+        b_trans: Whether to transpose rhs
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for matrix multiplication with accumulation
+    """
+    actual_span = _get_span_or_capture(span)
+    kwargs: dict[str, Any] = {"a_trans": a_trans, "b_trans": b_trans}
+    return _ir_core.create_op_call("tensor.matmul_acc", [acc, lhs, rhs], kwargs, actual_span)
+
+
 def mul(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
     """Element-wise multiplication of tensor and tensor or scalar.
 
@@ -824,3 +850,36 @@ def transpose(
     if valid_shape is not None:
         args.append(_to_make_tuple(valid_shape, actual_span))
     return _ir_core.create_op_call("tensor.transpose", args, {}, actual_span)
+
+
+def scatter_update(
+    input: Expr,
+    dim: int,
+    index: Expr,
+    src: Expr,
+    span: Span | None = None,
+) -> Call:
+    """Update input tensor rows at positions specified by 2D index with values from src.
+
+    Supports two variants based on input/src rank:
+    - 2D: input [rows, d], src [b*s, d], index [b, s]
+    - 4D: input [blockNum, blockSize, 1, d], src [b, s, 1, d], index [b, s]
+
+    For each (i, j): input[index[i*s+j]] row = src[i*s+j] row (linear layout).
+
+    Args:
+        input: Destination tensor (2D or 4D TensorType)
+        dim: Dimension to scatter along (default: -2, currently the only supported value)
+        index: 2D index tensor [b, s] of integer dtype
+        src: Source tensor (2D [b*s, d] or 4D [b, s, 1, d])
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression returning the updated input tensor
+    """
+    actual_span = _get_span_or_capture(span)
+    args = [input, index, src]
+    # dim may arrive as a ConstInt when called from the DSL parser — extract the int value
+    dim_val = int(dim.value) if isinstance(dim, ConstInt) else int(dim)
+    kwargs: dict[str, Any] = {"dim": dim_val}
+    return _ir_core.create_op_call("tensor.scatter_update", args, kwargs, actual_span)

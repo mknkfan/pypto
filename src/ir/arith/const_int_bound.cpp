@@ -170,6 +170,8 @@ class ConstIntBoundAnalyzer::Impl : public ExprFunctor<Bound> {
 
   void Bind(const VarPtr& var, const Bound& bound) { var_map_[var.get()] = bound; }
 
+  void Unbind(const VarPtr& var) { var_map_.erase(var.get()); }
+
   std::function<void()> EnterConstraint(const ExprPtr& constraint);
 
   Bound VisitExpr(const ExprPtr& expr) override { return ExprFunctor<Bound>::VisitExpr(expr); }
@@ -455,6 +457,9 @@ std::function<void()> ConstIntBoundAnalyzer::Impl::EnterConstraint(const ExprPtr
       TryParseConstraint(and_op->left_);
       TryParseConstraint(and_op->right_);
     }
+    // Note: Not(comparison) is handled by ConstraintContext, which normalizes
+    // constraints via rewrite_simplify before dispatching to sub-analyzers.
+    // E.g., Not(Lt(a,b)) is rewritten to Ge(a,b) before reaching this code.
   };
 
   TryParseConstraint(constraint);
@@ -500,6 +505,8 @@ void ConstIntBoundAnalyzer::Update(const VarPtr& var, const Bound& bound) {
       << "Update requires min_value <= max_value, got [" << bound.min_value << ", " << bound.max_value << "]";
   impl_->Bind(var, bound);
 }
+
+void ConstIntBoundAnalyzer::Unbind(const VarPtr& var) { impl_->Unbind(var); }
 
 std::function<void()> ConstIntBoundAnalyzer::EnterConstraint(const ExprPtr& constraint) {
   return impl_->EnterConstraint(constraint);

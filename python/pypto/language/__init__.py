@@ -86,7 +86,7 @@ from .op.system_ops import (
     tpush_to_aic,
     tpush_to_aiv,
 )
-from .op.tensor_ops import assemble, create_tensor, dim
+from .op.tensor_ops import assemble, create_tensor, dim, scatter_update
 from .op.tile_ops import (
     abs,
     addc,
@@ -102,7 +102,6 @@ from .op.tile_ops import (
     load,
     log,
     lrelu,
-    matmul_acc,
     matmul_bias,
     max,
     maxs,
@@ -143,6 +142,7 @@ from .op.unified_ops import (
     expands,
     fillpad,
     matmul,
+    matmul_acc,
     maximum,
     mul,
     neg,
@@ -326,6 +326,7 @@ __all__ = [
     "create_tensor",
     "assemble",
     "dim",
+    "scatter_update",
     "FunctionType",
     "ForKind",
     "Level",

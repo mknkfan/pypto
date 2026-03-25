@@ -24,6 +24,7 @@ __all__ = [
     "slice",
     "fillpad",
     "matmul",
+    "matmul_acc",
     "mul",
     "muls",
     "add",
@@ -56,6 +57,7 @@ __all__ = [
     "concat",
     "reshape",
     "transpose",
+    "scatter_update",
 ]
 
 from pypto.ir.op import tensor_ops as _ir_ops
@@ -209,6 +211,29 @@ def matmul(
     lhs_expr = lhs.unwrap()
     rhs_expr = rhs.unwrap()
     call_expr = _ir_ops.matmul(lhs_expr, rhs_expr, out_dtype, a_trans, b_trans, c_matrix_nz)
+    return Tensor(expr=call_expr)
+
+
+def matmul_acc(
+    acc: Tensor,
+    lhs: Tensor,
+    rhs: Tensor,
+    a_trans: bool = False,
+    b_trans: bool = False,
+) -> Tensor:
+    """Matrix multiplication with accumulation: acc += lhs @ rhs.
+
+    Args:
+        acc: Accumulator tensor
+        lhs: Left-hand side tensor
+        rhs: Right-hand side tensor
+        a_trans: Whether to transpose lhs
+        b_trans: Whether to transpose rhs
+
+    Returns:
+        Tensor wrapping the matmul_acc operation
+    """
+    call_expr = _ir_ops.matmul_acc(acc.unwrap(), lhs.unwrap(), rhs.unwrap(), a_trans, b_trans)
     return Tensor(expr=call_expr)
 
 
@@ -717,4 +742,29 @@ def transpose(tensor: Tensor, axis1: int, axis2: int) -> Tensor:
     """
     tensor_expr = tensor.unwrap()
     call_expr = _ir_ops.transpose(tensor_expr, axis1, axis2)
+    return Tensor(expr=call_expr)
+
+
+def scatter_update(
+    input: Tensor,
+    dim: int,
+    index: Tensor,
+    src: Tensor,
+) -> Tensor:
+    """Update input tensor rows at positions specified by 2D index with values from src.
+
+    Supports two variants based on input/src rank:
+    - 2D: input [rows, d], src [b*s, d], index [b, s]
+    - 4D: input [blockNum, blockSize, 1, d], src [b, s, 1, d], index [b, s]
+
+    Args:
+        input: Destination tensor (2D or 4D)
+        dim: Dimension to scatter along (currently only -2 is supported)
+        index: 2D index tensor [b, s] of integer dtype
+        src: Source tensor (2D [b*s, d] or 4D [b, s, 1, d])
+
+    Returns:
+        Tensor wrapping the scatter_update operation
+    """
+    call_expr = _ir_ops.scatter_update(input.unwrap(), dim, index.unwrap(), src.unwrap())
     return Tensor(expr=call_expr)
